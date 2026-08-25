@@ -1,0 +1,35 @@
+{
+  "description": "Fixture hook state that must not be copied.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$HOME/.codex/hooks/safety.sh\"",
+            "timeout": 5,
+            "statusMessage": "Checking fixture safety"
+          },
+          {
+            "type": "command",
+            "command": "cd \"/Users/example-operator/.codex\" && /usr/bin/python3 -m example_context_bridge session-start",
+            "timeout": 10,
+            "statusMessage": "Loading external context"
+          }
+        ]
+      },
+      {
+        "matcher": "^startup$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$HOME/.codex/hooks/cache-purge.sh\"",
+            "timeout": 10,
+            "statusMessage": "Reclaiming build cache"
+          }
+        ]
+      }
+    ]
+  }
+}

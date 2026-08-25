@@ -1,0 +1,667 @@
+import assert from "node:assert/strict";
+import { execFile as execFileCallback } from "node:child_process";
+import {
+  chmod,
+  cp,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import { promisify } from "node:util";
+
+import { parse } from "smol-toml";
+
+const execFile = promisify(execFileCallback);
+const renderModule = await import("../../dist/bundle/render.js").catch(
+  () => null,
+);
+const sourceFixture = new URL(
+  "../fixtures/source-codex/clean/",
+  import.meta.url,
+);
+
+const manifest = () => ({
+  schemaVersion: 1,
+  configSource: "config.toml",
+  configKeys: [
+    "model",
+    "model_reasoning_effort",
+    "personality",
+    "service_tier",
+    "agents.max_depth",
+    "features.goals",
+    "features.hooks",
+    "features.multi_agent",
+  ],
+  configOverrides: {
+    analytics_enabled: false,
+    approval_policy: "on-request",
+    approvals_reviewer: "user",
+  },
+  allowedTokens: ["CODEX_HOME", "HOME", "LLM_WIKI_ROOT", "WORKSPACE_ROOT"],
+  files: [
+    {
+      source: "AGENTS.md",
+      target: "AGENTS.md",
+      mode: "0644",
+      replacements: [],
+    },
+    {
+      source: "agents/advisor.toml",
+      target: "agents/advisor.toml",
+      mode: "0644",
+      replacements: [],
+    },
+    {
+      source: "agents/oracle.toml",
+      target: "agents/oracle.toml",
+      mode: "0644",
+      capability: "oracle",
+      replacements: [],
+    },
+    {
+      source: "hooks/safety.sh",
+      target: "hooks/safety.sh",
+      mode: "0755",
+      replacements: [
+        {
+          search: "${HOME}/.codex",
+          replacement: "${CODEX_HOME}",
+          expectedMatches: 1,
+        },
+      ],
+    },
+    {
+      source: "rules/default.rules",
+      target: "rules/default.rules",
+      mode: "0644",
+      replacements: [],
+    },
+  ],
+  hooks: [
+    {
+      event: "PreToolUse",
+      matcher: "Bash",
+      sourceCommand: 'bash "$HOME/.codex/hooks/safety.sh"',
+      renderedCommand: 'bash "${CODEX_HOME}/hooks/safety.sh"',
+      timeout: 5,
+      requiredScript: "hooks/safety.sh",
+    },
+  ],
+  capabilities: [
+    {
+      name: "oracle",
+      requiredTokens: ["LLM_WIKI_ROOT"],
+      readOnly: true,
+      instructionSections: ["Consult the Oracle"],
+    },
+  ],
+  requirements: [
+    { name: "shell", executable: "/bin/sh", arguments: ["-c", "exit 0"] },
+    {
+      name: "oracle-shell",
+      executable: "/bin/sh",
+      arguments: ["-c", "exit 0"],
+      capability: "oracle",
+    },
+  ],
+  forbiddenLiterals: ["/Users/example-operator", "/Volumes/example-workspace"],
+  forbiddenPathSegments: [
+    ["auth", "json"].join("."),
+    "sessions",
+    "logs",
+    "cache",
+    "rollout",
+    "hooks.state",
+    "desktop",
+  ],
+  forbiddenPatternIds: [
+    "credential-assignment",
+    "github-token",
+    "openai-api-key",
+    "private-key",
+  ],
+});
+
+async function createSourceRepository() {
+  const repository = await mkdtemp(join(tmpdir(), "andrew-code-agent-render-"));
+  await cp(sourceFixture, repository, { recursive: true });
+  await writeFile(
+    join(repository, "AGENTS.md"),
+    "# Fixture Instructions\n\n## Core Rules\n\nKeep the base profile portable.\n\n## Consult the Oracle\n\nUse ${LLM_WIKI_ROOT} only for read-only precedent retrieval.\n\n## Closing Rules\n\nKeep working without the optional adapter.\n",
+  );
+  await writeFile(
+    join(repository, "agents", "oracle.toml"),
+    'name = "oracle"\nwiki_root = "${LLM_WIKI_ROOT}"\n',
+  );
+  await writeFile(
+    join(repository, "hooks", "safety.sh"),
+    '#!/bin/sh\nprintf "%s\\n" "${HOME}/.codex"\n',
+  );
+  await chmod(join(repository, "hooks", "safety.sh"), 0o755);
+  await execFile("git", ["init", "--quiet", repository]);
+  await execFile("git", [
+    "-C",
+    repository,
+    "config",
+    "user.email",
+    "test@example.invalid",
+  ]);
+  await execFile("git", ["-C", repository, "config", "user.name", "Test User"]);
+  await execFile("git", ["-C", repository, "add", "--all"]);
+  await execFile("git", [
+    "-C",
+    repository,
+    "commit",
+    "--quiet",
+    "-m",
+    "fixture",
+  ]);
+  return repository;
+}
+
+async function withSourceRepository(run) {
+  const repository = await createSourceRepository();
+  try {
+    await run(repository);
+  } finally {
+    await rm(repository, { recursive: true, force: true });
+  }
+}
+
+async function withWikiRoot(run) {
+  const wikiRoot = await mkdtemp(join(tmpdir(), "andrew-code-agent-wiki-"));
+  try {
+    await run(wikiRoot);
+  } finally {
+    await rm(wikiRoot, { recursive: true, force: true });
+  }
+}
+
+async function commitSourceChange(repository, relativePath, contents) {
+  await writeFile(join(repository, relativePath), contents);
+  await execFile("git", ["-C", repository, "add", "--", relativePath]);
+  await execFile("git", [
+    "-C",
+    repository,
+    "commit",
+    "--quiet",
+    "-m",
+    "fixture change",
+  ]);
+}
+
+async function withArgumentSensitiveExecutable(expectedArgument, run) {
+  const executableDirectory = await mkdtemp(
+    join(tmpdir(), "andrew-code-agent-executable-"),
+  );
+  const executablePath = join(executableDirectory, "fixture-command");
+  try {
+    await writeFile(
+      executablePath,
+      `#!/bin/sh
+if [ "$#" -eq 1 ] && [ "$1" = "${expectedArgument}" ]; then
+  exit 23
+fi
+exit 0
+`,
+    );
+    await chmod(executablePath, 0o755);
+    await run(executablePath);
+  } finally {
+    await rm(executableDirectory, { recursive: true, force: true });
+  }
+}
+
+function renderBundle(sourceRoot, bundleManifest, capabilities) {
+  assert.notEqual(
+    renderModule,
+    null,
+    "the built render module must be available",
+  );
+  return renderModule.renderBundle(sourceRoot, bundleManifest, capabilities);
+}
+
+function renderedText(bundle, targetPath) {
+  const file = bundle.files.find((entry) => entry.targetPath === targetPath);
+  assert.notEqual(file, undefined, `${targetPath} must be rendered`);
+  return new TextDecoder().decode(file.bytes);
+}
+
+function renderedMode(bundle, targetPath) {
+  const file = bundle.files.find((entry) => entry.targetPath === targetPath);
+  assert.notEqual(file, undefined, `${targetPath} must be rendered`);
+  return file.mode;
+}
+
+function assertRenderError(error, code) {
+  return error instanceof renderModule.RenderError && error.code === code;
+}
+
+test("projects only portable config and manifest-selected hooks without Oracle", async () => {
+  await withSourceRepository(async (repository) => {
+    const bundle = await renderBundle(repository, manifest(), {});
+    const config = renderedText(bundle, "config.toml");
+    const hooks = JSON.parse(renderedText(bundle, "hooks.json"));
+
+    assert.deepEqual(bundle.enabledCapabilities, []);
+    assert.deepEqual(bundle.disabledCapabilities, {
+      oracle: "Oracle input was not provided.",
+    });
+    assert.deepEqual(
+      bundle.files.map((file) => file.targetPath),
+      [
+        "AGENTS.md",
+        "agents/advisor.toml",
+        "config.toml",
+        "hooks.json",
+        "hooks/safety.sh",
+        "rules/default.rules",
+      ],
+    );
+    assert.deepEqual(parse(config), {
+      analytics_enabled: false,
+      approval_policy: "on-request",
+      approvals_reviewer: "user",
+      model: "gpt-5.6-terra",
+      model_reasoning_effort: "high",
+      personality: "pragmatic",
+      service_tier: "default",
+      agents: {
+        max_depth: 2,
+        advisor: { config_file: "./agents/advisor.toml" },
+      },
+      features: { goals: true, hooks: true, multi_agent: true },
+    });
+    assert.doesNotMatch(
+      config,
+      /(?:desktop|mcp_servers|notify|project_trust|apps)/u,
+    );
+    assert.deepEqual(hooks, {
+      hooks: {
+        PreToolUse: [
+          {
+            matcher: "Bash",
+            hooks: [
+              {
+                type: "command",
+                command: 'bash "${CODEX_HOME}/hooks/safety.sh"',
+                timeout: 5,
+              },
+            ],
+          },
+        ],
+      },
+    });
+    assert.doesNotMatch(
+      JSON.stringify(hooks),
+      /shared_memory|xcode|statusMessage/u,
+    );
+    assert.match(renderedText(bundle, "hooks/safety.sh"), /\$\{CODEX_HOME\}/u);
+    assert.doesNotMatch(
+      renderedText(bundle, "hooks/safety.sh"),
+      /\/Users\/example-operator/u,
+    );
+    assert.doesNotMatch(
+      renderedText(bundle, "AGENTS.md"),
+      /## Consult the Oracle/u,
+    );
+    assert.match(renderedText(bundle, "AGENTS.md"), /## Closing Rules/u);
+  });
+});
+
+test("enables Oracle only when its root and every requirement are available", async () => {
+  await withSourceRepository(async (repository) => {
+    await withWikiRoot(async (wikiRoot) => {
+      const bundle = await renderBundle(repository, manifest(), {
+        oracle: { llmWikiRoot: wikiRoot },
+      });
+      assert.deepEqual(bundle.enabledCapabilities, ["oracle"]);
+      assert.deepEqual(bundle.disabledCapabilities, {});
+      assert.match(renderedText(bundle, "AGENTS.md"), /## Consult the Oracle/u);
+      assert.match(
+        renderedText(bundle, "agents/oracle.toml"),
+        /\$\{LLM_WIKI_ROOT\}/u,
+      );
+      assert.deepEqual(
+        parse(renderedText(bundle, "config.toml")).agents.oracle,
+        { config_file: "./agents/oracle.toml" },
+      );
+    });
+  });
+});
+
+test("rejects partial Oracle prerequisites fail-closed", async () => {
+  await withSourceRepository(async (repository) => {
+    await assert.rejects(
+      renderBundle(repository, manifest(), {
+        oracle: { llmWikiRoot: "relative/wiki" },
+      }),
+      (error) => assertRenderError(error, "ORACLE_INPUT_INVALID"),
+    );
+    const unavailableRequirement = manifest();
+    unavailableRequirement.requirements[1].executable = "/missing/oracle-shell";
+    await withWikiRoot(async (wikiRoot) => {
+      await assert.rejects(
+        renderBundle(repository, unavailableRequirement, {
+          oracle: { llmWikiRoot: wikiRoot },
+        }),
+        (error) =>
+          assertRenderError(error, "CAPABILITY_REQUIREMENT_UNAVAILABLE"),
+      );
+    });
+  });
+});
+
+test("fails when a base dependency or bounded replacement contract is unusable", async () => {
+  await withSourceRepository(async (repository) => {
+    const missingHook = manifest();
+    missingHook.hooks[0].requiredScript = "hooks/missing.sh";
+    missingHook.hooks[0].renderedCommand =
+      'bash "${CODEX_HOME}/hooks/missing.sh"';
+    await assert.rejects(renderBundle(repository, missingHook, {}), (error) =>
+      assertRenderError(error, "HOOK_DEPENDENCY_MISSING"),
+    );
+    const wrongReplacementCount = manifest();
+    wrongReplacementCount.files[3].replacements[0].expectedMatches = 2;
+    await assert.rejects(
+      renderBundle(repository, wrongReplacementCount, {}),
+      (error) => assertRenderError(error, "REPLACEMENT_COUNT_MISMATCH"),
+    );
+    const missingBaseRequirement = manifest();
+    missingBaseRequirement.requirements[0].executable = "/missing/base-shell";
+    await assert.rejects(
+      renderBundle(repository, missingBaseRequirement, {}),
+      (error) => assertRenderError(error, "BASE_REQUIREMENT_UNAVAILABLE"),
+    );
+  });
+});
+
+test("rejects a required executable without execute permission", async () => {
+  await withSourceRepository(async (repository) => {
+    const executableDirectory = await mkdtemp(
+      join(tmpdir(), "andrew-code-agent-executable-"),
+    );
+    const executablePath = join(executableDirectory, "not-executable");
+    try {
+      await writeFile(executablePath, "#!/bin/sh\nexit 0\n");
+      await chmod(executablePath, 0o644);
+      const unavailableRequirement = manifest();
+      unavailableRequirement.requirements[0].executable = executablePath;
+      await assert.rejects(
+        renderBundle(repository, unavailableRequirement, {}),
+        (error) => assertRenderError(error, "BASE_REQUIREMENT_UNAVAILABLE"),
+      );
+    } finally {
+      await rm(executableDirectory, { recursive: true, force: true });
+    }
+  });
+});
+
+test("rejects hook commands outside the required CODEX_HOME script form", async () => {
+  await withSourceRepository(async (repository) => {
+    for (const renderedCommand of [
+      'bash "/tmp/safety.sh"',
+      'bash "${CODEX_HOME}/hooks/safety.sh" && echo unsafe',
+    ]) {
+      const invalidHook = manifest();
+      invalidHook.hooks[0].renderedCommand = renderedCommand;
+      await assert.rejects(renderBundle(repository, invalidHook, {}), (error) =>
+        assertRenderError(error, "HOOK_COMMAND_INVALID"),
+      );
+    }
+  });
+});
+
+test("rejects selected runtime requirements that exit nonzero", async () => {
+  await withSourceRepository(async (repository) => {
+    await withArgumentSensitiveExecutable("--base", async (executablePath) => {
+      const unavailableBaseRequirement = manifest();
+      unavailableBaseRequirement.requirements[0].executable = executablePath;
+      unavailableBaseRequirement.requirements[0].arguments = ["--base"];
+      await assert.rejects(
+        renderBundle(repository, unavailableBaseRequirement, {}),
+        (error) => assertRenderError(error, "BASE_REQUIREMENT_UNAVAILABLE"),
+      );
+    });
+
+    await withArgumentSensitiveExecutable(
+      "--oracle",
+      async (executablePath) => {
+        const unavailableOracleRequirement = manifest();
+        unavailableOracleRequirement.requirements[1].executable =
+          executablePath;
+        unavailableOracleRequirement.requirements[1].arguments = ["--oracle"];
+        await withWikiRoot(async (wikiRoot) => {
+          await assert.rejects(
+            renderBundle(repository, unavailableOracleRequirement, {
+              oracle: { llmWikiRoot: wikiRoot },
+            }),
+            (error) =>
+              assertRenderError(error, "CAPABILITY_REQUIREMENT_UNAVAILABLE"),
+          );
+        });
+      },
+    );
+  });
+});
+
+test("rejects duplicate manifest selections and duplicate source hook identities", async () => {
+  await withSourceRepository(async (repository) => {
+    const duplicateSelection = manifest();
+    duplicateSelection.hooks.push({ ...duplicateSelection.hooks[0] });
+    await assert.rejects(
+      renderBundle(repository, duplicateSelection, {}),
+      (error) => assertRenderError(error, "HOOK_CARDINALITY_INVALID"),
+    );
+  });
+
+  await withSourceRepository(async (repository) => {
+    const hooksPath = join(repository, "hooks.json");
+    const sourceHooks = JSON.parse(await readFile(hooksPath, "utf8"));
+    sourceHooks.hooks.PreToolUse[0].hooks.push({
+      type: "command",
+      command: 'bash "$HOME/.codex/hooks/safety.sh"',
+      timeout: 5,
+    });
+    await commitSourceChange(
+      repository,
+      "hooks.json",
+      `${JSON.stringify(sourceHooks, null, 2)}\n`,
+    );
+    await assert.rejects(renderBundle(repository, manifest(), {}), (error) =>
+      assertRenderError(error, "HOOK_CARDINALITY_INVALID"),
+    );
+  });
+});
+
+test("reserves generated config and hooks targets case-insensitively", async () => {
+  await withSourceRepository(async (repository) => {
+    for (const target of ["Config.toml", "Hooks.json"]) {
+      const collidingManifest = manifest();
+      collidingManifest.files.push({
+        source: "rules/default.rules",
+        target,
+        mode: "0644",
+        replacements: [],
+      });
+      await assert.rejects(
+        renderBundle(repository, collidingManifest, {}),
+        (error) => assertRenderError(error, "RENDERED_TARGET_CONFLICT"),
+      );
+    }
+  });
+});
+
+test("rejects capability inputs outside the declared Oracle shape", async () => {
+  await withSourceRepository(async (repository) => {
+    await assert.rejects(
+      renderBundle(repository, manifest(), { unknown: true }),
+      (error) => assertRenderError(error, "CAPABILITY_INPUT_INVALID"),
+    );
+    const withoutOracle = manifest();
+    withoutOracle.capabilities = [];
+    await withWikiRoot(async (wikiRoot) => {
+      for (const capabilities of [
+        { oracle: {} },
+        { oracle: { llmWikiRoot: wikiRoot, extra: true } },
+        { oracle: [] },
+        { oracle: { llmWikiRoot: 1 } },
+        { oracle: { llmWikiRoot: wikiRoot } },
+      ]) {
+        await assert.rejects(
+          renderBundle(repository, withoutOracle, capabilities),
+          (error) => assertRenderError(error, "CAPABILITY_INPUT_INVALID"),
+        );
+      }
+    });
+  });
+});
+
+test("rejects disabled Oracle tokens outside its removed instruction section", async () => {
+  await withSourceRepository(async (repository) => {
+    const agentsPath = join(repository, "AGENTS.md");
+    const agents = await readFile(agentsPath, "utf8");
+    await commitSourceChange(
+      repository,
+      "AGENTS.md",
+      `Base path: ${"${HOME}"}\n\n${agents}\nOutside: ${"${LLM_WIKI_ROOT}"}\n`,
+    );
+    await assert.rejects(renderBundle(repository, manifest(), {}), (error) =>
+      assertRenderError(error, "DISABLED_CAPABILITY_TOKEN"),
+    );
+  });
+
+  await withSourceRepository(async (repository) => {
+    const agentsPath = join(repository, "AGENTS.md");
+    const agents = await readFile(agentsPath, "utf8");
+    await commitSourceChange(
+      repository,
+      "AGENTS.md",
+      `Base path: ${"${HOME}"}\n\n${agents}`,
+    );
+    await assert.doesNotReject(renderBundle(repository, manifest(), {}));
+  });
+});
+
+test("rejects duplicate disabled Oracle instruction headings", async () => {
+  await withSourceRepository(async (repository) => {
+    const agentsPath = join(repository, "AGENTS.md");
+    const agents = await readFile(agentsPath, "utf8");
+    await commitSourceChange(
+      repository,
+      "AGENTS.md",
+      `${agents}\n## Consult the Oracle\n\nDuplicate adapter instructions.\n`,
+    );
+    await assert.rejects(renderBundle(repository, manifest(), {}), (error) =>
+      assertRenderError(error, "INSTRUCTION_SECTION_CARDINALITY"),
+    );
+  });
+});
+
+test("rejects config scalar-table collisions while allowing exact-key overrides", async () => {
+  await withSourceRepository(async (repository) => {
+    const tableThenScalar = manifest();
+    tableThenScalar.configOverrides.features = false;
+    await assert.rejects(
+      renderBundle(repository, tableThenScalar, {}),
+      (error) => assertRenderError(error, "CONFIG_INVALID"),
+    );
+
+    const exactKeyOverride = manifest();
+    exactKeyOverride.configOverrides.model = "fixed-model";
+    const bundle = await renderBundle(repository, exactKeyOverride, {});
+    assert.equal(
+      parse(renderedText(bundle, "config.toml")).model,
+      "fixed-model",
+    );
+  });
+
+  await withSourceRepository(async (repository) => {
+    await commitSourceChange(repository, "config.toml", "features = false\n");
+    const scalarThenTable = manifest();
+    scalarThenTable.configKeys = ["features"];
+    scalarThenTable.configOverrides = { "features.goals": true };
+    await assert.rejects(
+      renderBundle(repository, scalarThenTable, {}),
+      (error) => assertRenderError(error, "CONFIG_INVALID"),
+    );
+  });
+});
+
+// Codex rewrites its own config owner-only on every session, so the bundle
+// installs it that way rather than widening it back to 0644 on each run.
+test("the rendered config is owner-only and the rendered hooks file is not", async () => {
+  await withSourceRepository(async (repository) => {
+    const bundle = await renderBundle(repository, manifest(), {});
+    assert.equal(renderedMode(bundle, "config.toml"), 0o600);
+    assert.equal(renderedMode(bundle, "hooks.json"), 0o644);
+  });
+});
+
+test("the enabled Oracle root is scanned for even when the manifest never heard of it", async () => {
+  // Deliberately outside forbiddenLiterals, which is ["/Users/example-operator",
+  // "/Volumes/example-workspace"]. A root under either prefix would be caught by
+  // accident of this machine's layout and would prove nothing.
+  const wiki = await mkdtemp(join(tmpdir(), "andrew-code-agent-wiki-"));
+  const repository = await createSourceRepository();
+  try {
+    assert.equal(manifest().forbiddenLiterals.some((literal) => wiki.startsWith(literal)), false, "the fixture root must be one the manifest does not declare");
+
+    // Clean first: the same render with the same root passes while no file
+    // carries it, so the rejection below is about the content and not the
+    // capability being on.
+    const clean = await renderBundle(repository, manifest(), { oracle: { llmWikiRoot: wiki } });
+    assert.equal(clean.files.some((file) => new TextDecoder().decode(file.bytes).includes(wiki)), false);
+
+    // A bundled file that hardcodes the operator's wiki path instead of the
+    // token is exactly what this scan exists to stop.
+    await writeFile(join(repository, "agents", "oracle.toml"), `name = "oracle"\nwiki_root = "${wiki}"\n`);
+    await execFile("git", ["-C", repository, "add", "--all"]);
+    await execFile("git", ["-C", repository, "commit", "--quiet", "-m", "hardcode the wiki root"]);
+    await assert.rejects(renderBundle(repository, manifest(), { oracle: { llmWikiRoot: wiki } }), (error) => {
+      assert.equal(error.code, "FORBIDDEN_LITERAL");
+      // The refusal names the file, never the path it found.
+      assert.equal(String(error.message).includes(wiki), false);
+      return true;
+    });
+  } finally {
+    await rm(wiki, { recursive: true, force: true });
+    await rm(repository, { recursive: true, force: true });
+  }
+});
+
+test("a symlinked Oracle root is scanned under both spellings", async () => {
+  const canonical = await realpath(await mkdtemp(join(tmpdir(), "andrew-code-agent-wiki-real-")));
+  const linkParent = await mkdtemp(join(tmpdir(), "andrew-code-agent-wiki-link-"));
+  const link = join(linkParent, "wiki");
+  await symlink(canonical, link);
+  const repository = await createSourceRepository();
+  try {
+    assert.notEqual(link, canonical, "the fixture must actually differ from its target");
+
+    // A rendered file carrying the canonical target must be refused even
+    // though the capability input names the link, because they identify the
+    // same enabled root.
+    await writeFile(join(repository, "agents", "oracle.toml"), `name = "oracle"\nwiki_root = "${canonical}"\n`);
+    await execFile("git", ["-C", repository, "add", "--all"]);
+    await execFile("git", ["-C", repository, "commit", "--quiet", "-m", "hardcode the canonical wiki root"]);
+    await assert.rejects(renderBundle(repository, manifest(), { oracle: { llmWikiRoot: link } }), { code: "FORBIDDEN_LITERAL" });
+
+    // And the reverse: a file carrying the link spelling is refused too.
+    await writeFile(join(repository, "agents", "oracle.toml"), `name = "oracle"\nwiki_root = "${link}"\n`);
+    await execFile("git", ["-C", repository, "add", "--all"]);
+    await execFile("git", ["-C", repository, "commit", "--quiet", "-m", "hardcode the link spelling"]);
+    await assert.rejects(renderBundle(repository, manifest(), { oracle: { llmWikiRoot: link } }), { code: "FORBIDDEN_LITERAL" });
+  } finally {
+    await rm(linkParent, { recursive: true, force: true });
+    await rm(canonical, { recursive: true, force: true });
+    await rm(repository, { recursive: true, force: true });
+  }
+});
