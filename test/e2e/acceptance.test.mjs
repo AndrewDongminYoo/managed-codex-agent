@@ -3,7 +3,7 @@
 // Every scenario spawns dist/cli.js as a child process with an explicitly
 // constructed environment. The child must never inherit process.env: the
 // runtime resolves HOME and the ANDREW_AGENT_* roots from its own environment,
-// so an inherited one would reach the operator's real Codex home and real
+// so an inherited one would reach the user's real Codex home and real
 // Application Support directory.
 
 import assert from "node:assert/strict";
@@ -48,7 +48,7 @@ function isInside(parent, child) {
 // Refuses any environment whose runtime roots escape the fixture. Proven to
 // refuse by the "guard refuses an inherited HOME" case below; without that
 // proof a passing scenario cannot be distinguished from one that silently ran
-// against the operator's real state.
+// against the user's real state.
 export function acceptanceEnvironment(fixtureRoot, values) {
   for (const key of scopedKeys) {
     const value = values[key];
@@ -374,7 +374,7 @@ async function runCliOnPty(fixture, argv, selection) {
   }
 }
 
-test("a gated action is approved when the operator answers on a terminal", async () => {
+test("a gated action is approved when the user answers on a terminal", async () => {
   const fixture = await createEnvironment();
   try {
     const scriptPath = await writeApprovalScript(fixture);
@@ -491,7 +491,7 @@ test("an unaccountable install journal blocks the next run instead of proceeding
     );
 
     // The leftover journal invalidates the active installation rather than
-    // surfacing under INSTALL_JOURNAL, which is what an operator will read.
+    // surfacing under INSTALL_JOURNAL, which is what a user will read.
     const doctor = await runCli(environment, ["doctor"]);
     assert.equal(findings(doctor.stdout).get("ACTIVE_INSTALL"), "blocker", doctor.stdout);
     assert.equal(doctor.code, 1);
@@ -511,7 +511,7 @@ test("an unaccountable install journal blocks the next run instead of proceeding
 });
 
 // The fixture synthesizes authentication into the managed home, which is the
-// one step an operator has to perform themselves. Without this case the
+// one step a user has to perform themselves. Without this case the
 // acceptance layer never exercises a machine that has not been logged in —
 // the gap that let the README document a first-run sequence that could not
 // work.
@@ -585,7 +585,7 @@ test(
 
     const fixture = await createEnvironment();
     try {
-      // The managed home must be the fixture's, never the operator's.
+      // The managed home must be the fixture's, never the user's.
       const productionStateRoot = join(
         process.env.HOME ?? "/nonexistent",
         "Library", "Application Support", "andrew-code-agent",
@@ -707,8 +707,8 @@ test(
         "the real Codex did not rewrite the managed config, so this gate is vacuous",
       );
 
-      // Doctor is read-only, so this is the rewrite seen exactly as an
-      // operator sees it between runs. It reported ACTIVE_INSTALL as a blocker
+      // Doctor is read-only, so this is the rewrite seen exactly as a
+      // user sees it between runs. It reported ACTIVE_INSTALL as a blocker
       // and exited 1 before the reset-before-run class existed.
       const doctor = await runCli(environment, ["doctor"]);
       assert.equal(doctor.code, 0, `${doctor.stdout}\n${doctor.stderr}`);

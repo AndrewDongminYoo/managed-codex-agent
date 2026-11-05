@@ -107,7 +107,7 @@ sections that are rendered only when it is enabled, plus external executables
 whose presence is asserted before it is.
 
 `oracle` is the only capability in this version. It is off by default, enabled
-per run with `--capability oracle`, and needs an operator-supplied knowledge
+per run with `--capability oracle`, and needs a user-supplied knowledge
 base whose location comes from the environment rather than the command line.
 
 The capability set flows one way: the CLI parses it, `resolveRuntimePaths`

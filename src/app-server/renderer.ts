@@ -69,7 +69,7 @@ function valueText(value: unknown, key: string): string | null {
   return typeof candidate === "string" ? bounded(candidate) : null;
 }
 
-// The whole message reaches the operator, but never as one unbounded write:
+// The whole message reaches the user, but never as one unbounded write:
 // it is split on character boundaries into lines that each satisfy the same
 // byte bound as every other rendered line. Escaping happens per part and the
 // walk stops at the line cap, so a hostile value is never materialised — the

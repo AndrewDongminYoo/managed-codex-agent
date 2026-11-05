@@ -41,6 +41,6 @@ break in:
 
 - The Codex CLI itself and anything it does once running. Report those upstream.
 - Any behaviour under a modified `agent-bundle.toml` that disables the scans
-  above; the manifest is trusted input supplied by the operator.
+  above; the manifest is trusted input supplied by the user.
 - Running against a Codex version other than the pinned one. The version gate
   refuses it, and bypassing that gate is unsupported.

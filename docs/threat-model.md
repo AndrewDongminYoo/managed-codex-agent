@@ -6,11 +6,11 @@ rather than tidying it.
 
 ## What is trusted
 
-- **The operator.** They choose the target repository, the prompt, and the
+- **The user.** They choose the target repository, the prompt, and the
   bundle source.
 - **`agent-bundle.toml` and the profile it names.** The manifest declares what
   is forbidden in rendered output, so a manifest that declares nothing forbids
-  nothing. It is operator-authored input, not adversarial input.
+  nothing. It is user-authored input, not adversarial input.
 - **The pinned Codex binary**, once its version is verified.
 
 ## What is not trusted
@@ -87,9 +87,9 @@ refused, and the refusal names neither the old nor the new path.
 - **Sandboxing the model's own actions.** Codex's sandbox and approval policy do
   that. This project chooses the policy and answers the prompts; it does not
   contain the process.
-- **Protecting against a hostile operator.** Anyone who can edit the manifest
+- **Protecting against a hostile user.** Anyone who can edit the manifest
   can disable the scans.
-- **Multi-tenant isolation.** One operator, one machine, one lock.
+- **Multi-tenant isolation.** One user, one machine, one lock.
 - **Running against an unpinned Codex.** The version gate refuses it because the
   generated contract is only known to match one version.
 - **Secrecy of the target repository's contents.** The agent reads the
