@@ -260,7 +260,7 @@ test("a message in flight renders a constant, and its text only when complete", 
 });
 
 // The same cap that bounded the reprints also truncated the answer where it was
-// printed, mid-sentence, in the one place the operator reads it.
+// printed, mid-sentence, in the one place the user reads it.
 test("a completed message longer than the old cap renders without truncation", () => {
   const text = "요약: ".concat("변경 사항을 확인했습니다. ".repeat(40));
   const lines = renderer().renderTurnState({

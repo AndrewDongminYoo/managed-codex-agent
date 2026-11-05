@@ -282,7 +282,7 @@ function isSupportedCapability(value: string): value is RequestedCapability {
 }
 
 // A capability whose declared input is absent fails by name rather than being
-// dropped, so an operator never gets a quiet run without what they asked for.
+// dropped, so a user never gets a quiet run without what they asked for.
 // Only presence is decided here; canonicalizing the root is runtime-path work.
 function missingCapabilityInput(
   capabilities: readonly RequestedCapability[],
