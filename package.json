@@ -23,7 +23,7 @@
     "check": "pnpm typecheck && pnpm test"
   },
   "dependencies": {
-    "smol-toml": "1.8.0"
+    "smol-toml": "1.9.0"
   },
   "devDependencies": {
     "@types/node": "24.13.3",

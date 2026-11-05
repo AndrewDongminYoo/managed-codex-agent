@@ -265,7 +265,7 @@ test("projects only portable config and manifest-selected hooks without Oracle",
         "rules/default.rules",
       ],
     );
-    assert.deepEqual(parse(config), {
+    assert.deepEqual(structuredClone(parse(config)), {
       analytics_enabled: false,
       approval_policy: "on-request",
       approvals_reviewer: "user",
@@ -330,7 +330,9 @@ test("enables Oracle only when its root and every requirement are available", as
         /\$\{LLM_WIKI_ROOT\}/u,
       );
       assert.deepEqual(
-        parse(renderedText(bundle, "config.toml")).agents.oracle,
+        structuredClone(
+          parse(renderedText(bundle, "config.toml")).agents.oracle,
+        ),
         { config_file: "./agents/oracle.toml" },
       );
     });
