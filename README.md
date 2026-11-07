@@ -50,6 +50,7 @@ every recorded digest; it is left alone deliberately.
 - A Codex CLI install at the pinned version
 - A Codex profile directory that is a clean Git worktree with every bundled
   file tracked
+- The GitHub CLI (`gh`), signed in, for `triage` only
 
 ## Install
 
@@ -94,13 +95,38 @@ the current environment would enable. `status` with no argument resolves the
 latest thread for the repository you are standing in. `resume` with no prompt
 prints the stored record and starts no turn.
 
+Standalone commands run one bounded Codex task, or none, against the repository
+you are standing in. None of them pushes or writes to GitHub:
+
+- `commit [--long | --short]` proposes a message for the staged changes and
+  commits when invoked from a terminal.
+- `review [--staged | base]` reviews committed branch changes against a base,
+  or only the staged changes against `HEAD`, in an isolated checkout.
+- `pr [base]` drafts a Markdown pull-request body from committed branch
+  changes.
+- `triage <pr>` classifies the unresolved bot review threads of one pull
+  request as valid, invalid, or already fixed, reading them through `gh`.
+- `drift` audits `CLAUDE.md`, `AGENTS.md`, `README.md`, and `docs/specs/`
+  against the code at `HEAD` and reports stale claims.
+- `verify-fix [base] [--with <path>]... [--test <path>]... -- <command>` runs
+  your test command with the branch's production changes reverted and again at
+  `HEAD`, in sandboxed checkouts with the network blocked, and exits 0 only when
+  the tests fail without the fix and pass with it. It never runs Codex.
+- `clean-gone` removes local branches whose upstream is gone, with their
+  worktrees, after printing a preview. It never runs Codex.
+
+`node dist/cli.js <command> --help` prints the exact usage of each command.
+
 Exit codes:
 
 - `0` — succeeded, or the turn completed.
-- `1` — the turn failed, the thread was not found, or output could not be
-  written.
+- `1` — the turn, review, PR draft, or triage failed, `drift` reported
+  findings, `verify-fix` did not verify the fix, a `clean-gone` removal failed,
+  the thread was not found, or output could not be written.
 - `2` — invalid command usage.
-- `3` — preflight or runtime preparation failed, including a Doctor blocker.
+- `3` — repository, comparison, preflight, or runtime preparation failed,
+  including a Doctor blocker, or a command refused or discarded a result
+  because its inputs moved.
 - `4` — the App Server failed.
 - `130` — the turn was interrupted.
 
@@ -132,7 +158,7 @@ what you point it at, which is why it is a capability rather than a feature.
 pnpm check        # typecheck plus all four test layers
 ```
 
-Three gates are opt-in and skip with a printed notice when their environment is
+Five gates are opt-in and skip with a printed notice when their environment is
 absent, so a default green `pnpm check` does not cover them:
 
 - `test/contract/client.test.mjs` needs `ANDREW_AGENT_PINNED_CODEX_BIN`, and
@@ -145,6 +171,13 @@ absent, so a default green `pnpm check` does not cover them:
   `ANDREW_AGENT_SMOKE_AUTH` for the two-run gate. They prove a real Codex
   accepts the installed configuration, and that a second run survives the
   configuration rewrite the first one caused.
+- The cache-boundary smoke in `test/e2e/acceptance.test.mjs` needs
+  `ANDREW_AGENT_CACHE_BOUNDARY_SMOKE`, `ANDREW_AGENT_SMOKE_AUTH`, and
+  `ANDREW_AGENT_SMOKE_CODEX_BIN`.
+- `test/e2e/oracle-boundary.test.mjs` needs `ANDREW_AGENT_WIKI_SERVER_ROOT`,
+  a knowledge-base MCP server checkout it builds a synthetic vault from; its two
+  real-Codex checks also need `ANDREW_AGENT_REAL_SMOKE`,
+  `ANDREW_AGENT_SMOKE_AUTH`, and `ANDREW_AGENT_SMOKE_CODEX_BIN`.
 
 Each layer script is wrapped so a missing directory exits 0, and a skipped test
 counts as a pass. **Read a green aggregate as "nothing failed", not as
@@ -169,6 +202,12 @@ them by hand:
 codex app-server generate-ts --out src/generated/codex-app-server
 codex app-server generate-json-schema --out schemas/codex-app-server
 ```
+
+Generate into empty directories when replacing an existing contract; the
+generator does not remove obsolete files from its output directory.
+Regenerating also changes `REQUIRED_CODEX_CONTRACT_DIGEST` in
+`src/constants.ts`, which Doctor compares against a tree it regenerates from
+the resolved binary, so update the constant in the same commit.
 
 The generated TypeScript package uses the CommonJS boundary in
 `src/generated/package.json`, which the build copies to
