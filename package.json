@@ -1,6 +1,6 @@
 {
   "name": "andrew-code-agent",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "license": "Apache-2.0",
   "bin": {
@@ -9,8 +9,8 @@
   "type": "module",
   "packageManager": "pnpm@11.22.0",
   "engines": {
-    "node": "24.19.0",
-    "pnpm": "11.22.0"
+    "node": "^24.20.0",
+    "pnpm": "^11.22.0"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && cp src/generated/package.json dist/generated/package.json",
@@ -23,10 +23,10 @@
     "check": "pnpm typecheck && pnpm test"
   },
   "dependencies": {
-    "smol-toml": "1.9.0"
+    "smol-toml": "1.9.1"
   },
   "devDependencies": {
-    "@types/node": "24.13.3",
+    "@types/node": "24.19.2",
     "typescript": "7.0.2"
   }
 }

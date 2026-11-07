@@ -14,6 +14,8 @@ import { basename, delimiter, dirname, join, relative } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
+import { probeStrictConfig } from "../helpers/strict-config.mjs";
+
 const execFileAsync = promisify(execFile);
 const clientModule = await import("../../dist/app-server/client.js").catch(
   () => null,
@@ -63,7 +65,7 @@ async function inventory(root) {
 async function withFakeCodex(
   scenario,
   run,
-  { version = "codex-cli 0.148.0" } = {},
+  { version = "codex-cli 0.167.0" } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), "andrew-agent-codex-"));
   const codexHome = join(root, "home");
@@ -92,7 +94,6 @@ const initializeResult = { userAgent: "codex-test", codexHome: home, platformFam
 let initialized = false;
 let queued = [];
 let serverRequested = false;
-if (scenario === "handshake-timeout") setInterval(() => {}, 1000);
 const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
 for await (const line of lines) {
   const message = JSON.parse(line);
@@ -100,7 +101,7 @@ for await (const line of lines) {
   if (message.method === "initialize") {
     if (scenario === "malformed-jsonl") { process.stdout.write("{not-json}\\n"); continue; }
     if (scenario === "malformed-envelope") { send({ id: message.id, result: initializeResult, error: { code: -1, message: "bad" } }); continue; }
-    if (scenario !== "handshake-timeout") send({ id: message.id, result: initializeResult });
+    send({ id: message.id, result: initializeResult });
     continue;
   }
   if (message.method === "initialized") {
@@ -116,7 +117,6 @@ for await (const line of lines) {
   if (scenario === "request") send({ method: "item/tool/requestUserInput", id: "server-1", params: { threadId: "t", turnId: "u", itemId: "i", questions: [] } });
   if (scenario === "respond" && message.method === undefined && message.id === "server-1") { send({ method: "response/observed", params: message }); continue; }
   if (scenario === "respond" && !serverRequested) { serverRequested = true; send({ method: "item/tool/requestUserInput", id: "server-1", params: { threadId: "t", turnId: "u", itemId: "i", questions: [] } }); }
-  if (scenario === "request-timeout") continue;
   if (scenario === "remote-error") { send({ id: message.id, error: { code: -32000, message: "sensitive upstream detail" } }); continue; }
   if (scenario === "out-of-order") {
     queued.push(message);
@@ -150,8 +150,13 @@ function startInput(binary, codexHome, overrides = {}) {
     codexBinary: binary,
     codexHome,
     productVersion: "0.1.0",
-    handshakeTimeoutMs: 300,
-    requestTimeoutMs: 300,
+    // A hang bound, not a mechanism under test: no scenario in this file lets
+    // either budget fire, and the timeout paths are covered in
+    // test/integration/transport.test.mjs with their own short budgets. The
+    // value therefore only needs to stay above the fake's slowest reply
+    // under load; 300 ms lost that race once inside `pnpm check` (#56).
+    handshakeTimeoutMs: 2_000,
+    requestTimeoutMs: 2_000,
     ...overrides,
   };
 }
@@ -189,6 +194,39 @@ test("regenerates stable artifacts byte-for-byte", { skip: pinnedCodexSkipReason
     await rm(temporary, { recursive: true, force: true });
   }
 });
+
+test(
+  "the pinned binary accepts a rendered MCP server table under strict config",
+  { skip: pinnedCodexSkipReason },
+  async () => {
+    const home = await mkdtemp(join(tmpdir(), "andrew-agent-mcp-strict-"));
+    try {
+      await writeFile(
+        join(home, "config.toml"),
+        [
+          "[mcp_servers]",
+          "",
+          "[mcp_servers.oracle]",
+          'command = "/bin/sh"',
+          'args = ["-c", "exec cat", "\\u007f"]',
+          'env_vars = ["LLM_WIKI_ROOT"]',
+          'enabled_tools = ["search_precedent"]',
+          'default_tools_approval_mode = "approve"',
+          "startup_timeout_sec = 5",
+          "tool_timeout_sec = 5",
+          "",
+          "[mcp_servers.oracle.env]",
+          'LLM_WIKI_MCP_MODE = "managed"',
+          "",
+        ].join("\n"),
+      );
+      const probe = await probeStrictConfig(pinnedCodexBin, home);
+      assert.equal(probe.code, 0, probe.stderr);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  },
+);
 
 test("completes initialize and initialized before typed thread calls", async () => {
   await withFakeCodex("normal", async ({ binary, codexHome, root }) => {

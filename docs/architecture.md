@@ -44,7 +44,8 @@ artifact:
 - `source-tree.ts` resolves only Git-tracked sources, so an untracked scratch
   file cannot enter a bundle.
 - `render.ts` renders config and hooks with token substitution, and gates files,
-  hooks, and instruction sections on the enabled capability set.
+  hooks, instruction sections, and `[[mcp_servers]]` tables on the enabled
+  capability set.
 - `validate.ts` scans the rendered bytes for secrets, credentials, forbidden
   literals, and leaked runtime identifiers.
 - `artifact.ts` writes the artifact with a `bundle-metadata.json` digest
@@ -72,7 +73,10 @@ reset-before-run file is converged, and only if the active install owns it.
 `ready`. Any blocker aborts before the App Server starts. It also spawns the
 real Codex against a shadow copy of the installed configuration to check that
 strict validation passes, which is the one check that cannot be answered from
-local state alone.
+local state alone. `SCHEMA_COMPATIBILITY` runs the resolved binary's two
+generator subcommands into a scratch root and compares the digest against
+`REQUIRED_CODEX_CONTRACT_DIGEST`, so a binary that reports the pinned version
+but generates a different contract is a blocker.
 
 ### 6. App Server session
 

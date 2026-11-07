@@ -14,7 +14,7 @@ the build does not require a Codex install:
 - `schemas/codex-app-server/` — JSON Schema documents
 
 They are generated at the exact version pinned in `src/constants.ts` as
-`REQUIRED_CODEX_VERSION`, which is `0.148.0`, by:
+`REQUIRED_CODEX_VERSION`, which is `0.167.0`, by:
 
 ```bash
 codex app-server generate-ts --out src/generated/codex-app-server

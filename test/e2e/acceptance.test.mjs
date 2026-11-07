@@ -7,11 +7,11 @@
 // Application Support directory.
 
 import assert from "node:assert/strict";
-import { execFile as execFileCallback, spawn } from "node:child_process";
+import { execFile as execFileCallback } from "node:child_process";
 import {
   chmod,
   copyFile,
-  cp,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
@@ -20,11 +20,20 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join, relative, resolve, sep } from "node:path";
+import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+
+import { probeStrictConfig } from "../helpers/strict-config.mjs";
+import {
+  acceptanceEnvironment,
+  createSmokeFixture as createEnvironment,
+  environmentFor,
+  runCli,
+  writeCodexWrapper,
+} from "../helpers/live-smoke.mjs";
 
 const execFile = promisify(execFileCallback);
 // fileURLToPath, not pathname: a checkout under a path with spaces or
@@ -32,138 +41,8 @@ const execFile = promisify(execFileCallback);
 // nothing on disk.
 const productRoot = fileURLToPath(new URL("../../", import.meta.url));
 const cliPath = join(productRoot, "dist", "cli.js");
-const fixtureCodex = join(productRoot, "test", "fixtures", "fake-app-server.mjs");
-const sourceFixture = join(productRoot, "test", "fixtures", "source-codex", "clean");
-const acceptanceManifest = join(productRoot, "test", "fixtures", "manifests", "acceptance.toml");
 
 const { REQUIRED_CODEX_VERSION } = await import(new URL("../../dist/constants.js", import.meta.url).href);
-
-const scopedKeys = ["HOME", "ANDREW_AGENT_CODEX_SOURCE", "ANDREW_AGENT_STATE_ROOT"];
-
-function isInside(parent, child) {
-  const path = relative(resolve(parent), resolve(child));
-  return path.length > 0 && !path.startsWith(`..${sep}`) && path !== "..";
-}
-
-// Refuses any environment whose runtime roots escape the fixture. Proven to
-// refuse by the "guard refuses an inherited HOME" case below; without that
-// proof a passing scenario cannot be distinguished from one that silently ran
-// against the user's real state.
-export function acceptanceEnvironment(fixtureRoot, values) {
-  for (const key of scopedKeys) {
-    const value = values[key];
-    if (typeof value !== "string" || value.length === 0)
-      throw new Error(`${key} must be set explicitly for the acceptance child`);
-    if (!isInside(fixtureRoot, value))
-      throw new Error(`${key} resolves outside the acceptance fixture: ${value}`);
-  }
-  return values;
-}
-
-async function createEnvironment() {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "andrew-agent-acceptance-")));
-  const home = join(root, "home");
-  const sourceRoot = join(root, "source");
-  const stateRoot = join(root, "state");
-  const target = join(root, "repository");
-
-  await mkdir(home, { mode: 0o700 });
-  await cp(sourceFixture, sourceRoot, { recursive: true });
-  await mkdir(join(sourceRoot, "agents"), { recursive: true });
-  await writeFile(
-    join(sourceRoot, "AGENTS.md"),
-    "# Fixture Instructions\n\n## Core Rules\n\nKeep the base profile portable.\n\n## Consult the Oracle\n\nUse ${LLM_WIKI_ROOT} only for read-only precedent retrieval.\n\n## Closing Rules\n\nKeep working without the optional adapter.\n",
-  );
-  await writeFile(
-    join(sourceRoot, "agents", "oracle.toml"),
-    'name = "oracle"\nwiki_root = "${LLM_WIKI_ROOT}"\n',
-  );
-  // The manifest declares this hook as 0755; the committed fixture copy is
-  // 0644, so the acceptance source tree must set the mode it promises.
-  await writeFile(
-    join(sourceRoot, "hooks", "safety.sh"),
-    '#!/bin/sh\nprintf "%s\\n" "${HOME}/.codex"\n',
-  );
-  await chmod(join(sourceRoot, "hooks", "safety.sh"), 0o755);
-  await copyFile(acceptanceManifest, join(sourceRoot, "agent-bundle.toml"));
-  await initializeRepository(sourceRoot);
-
-  // Doctor requires owner-only authentication material inside the managed
-  // home. Synthesize a non-secret fixture; real credentials are never read.
-  await mkdir(stateRoot, { mode: 0o700 });
-  await mkdir(join(stateRoot, "codex-home"), { mode: 0o700 });
-  await writeFile(
-    join(stateRoot, "codex-home", ["auth", ".json"].join("")),
-    `${JSON.stringify({ OPENAI_API_KEY: "fixture-only-not-a-credential" })}\n`,
-    { mode: 0o600 },
-  );
-
-  await mkdir(target, { mode: 0o700 });
-  await writeFile(join(target, "tracked.txt"), "before\n");
-  await initializeRepository(target);
-
-  const binRoot = join(root, "bin");
-  await mkdir(binRoot, { mode: 0o700 });
-  const fixture = { root, home, sourceRoot, stateRoot, target, codexBin: join(binRoot, "codex") };
-  await writeCodexWrapper(fixture);
-  return fixture;
-}
-
-async function initializeRepository(root) {
-  await execFile("git", ["init", "--quiet", root]);
-  await execFile("git", ["-C", root, "config", "user.email", "test@example.invalid"]);
-  await execFile("git", ["-C", root, "config", "user.name", "Test User"]);
-  await execFile("git", ["-C", root, "add", "--all"]);
-  await execFile("git", ["-C", root, "commit", "--quiet", "-m", "fixture"]);
-}
-
-function environmentFor(fixture, overrides = {}) {
-  return acceptanceEnvironment(fixture.root, {
-    HOME: fixture.home,
-    ANDREW_AGENT_CODEX_SOURCE: fixture.sourceRoot,
-    ANDREW_AGENT_STATE_ROOT: fixture.stateRoot,
-    ANDREW_AGENT_CODEX_BIN: fixture.codexBin,
-    PATH: process.env.PATH ?? "/usr/bin:/bin",
-    TMPDIR: process.env.TMPDIR ?? "/tmp",
-    ...overrides,
-  });
-}
-
-// startAppServer spawns the codex binary with only CODEX_HOME and PATH, so
-// scenario settings cannot reach the fixture through the CLI's environment.
-// A per-scenario wrapper carries them instead.
-async function writeCodexWrapper(fixture, settings = {}) {
-  const assignments = Object.entries({
-    ANDREW_AGENT_FAKE_SCRIPT: join(productRoot, "test", "fixtures", "protocol", "turn-success.jsonl"),
-    ...settings,
-  })
-    .map(([key, value]) => `${key}=${JSON.stringify(value)}\nexport ${key}`)
-    .join("\n");
-  await writeFile(
-    fixture.codexBin,
-    `#!/bin/sh\n${assignments}\nexec ${JSON.stringify(fixtureCodex)} "$@"\n`,
-    { mode: 0o755 },
-  );
-}
-
-// execFile rejects on a nonzero exit, but every scenario asserts an exact
-// code, so normalize both outcomes into one shape.
-async function runCli(environment, argv, options = {}) {
-  try {
-    const { stdout, stderr } = await execFile(process.execPath, [cliPath, ...argv], {
-      env: environment,
-      cwd: options.cwd ?? productRoot,
-      timeout: options.timeoutMs ?? 30_000,
-    });
-    return { code: 0, stdout, stderr };
-  } catch (error) {
-    return {
-      code: typeof error.code === "number" ? error.code : 1,
-      stdout: error.stdout ?? "",
-      stderr: error.stderr ?? "",
-    };
-  }
-}
 
 function findings(stdout) {
   const parsed = new Map();
@@ -539,28 +418,155 @@ test("an unauthenticated managed home blocks doctor and refuses to run", async (
 // A real turn additionally needs real credentials, which this smoke
 // deliberately does not supply, so it stops at configuration acceptance.
 const liveSmokeRequested = process.env.ANDREW_AGENT_REAL_SMOKE === "1";
+const cacheBoundarySmokeRequested =
+  process.env.ANDREW_AGENT_CACHE_BOUNDARY_SMOKE === "1";
 
-// The probe exits once its stdin closes; leaving the pipe open makes it serve.
-function probeStrictConfig(codexBin, codexHome) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(codexBin, ["app-server", "--strict-config", "--listen", "stdio://"], {
-      env: { CODEX_HOME: codexHome, PATH: process.env.PATH ?? "/usr/bin:/bin" },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    child.stdin.end();
-    let stderr = "";
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      reject(new Error("the strict-config probe did not exit"));
-    }, 30_000);
-    child.once("error", reject);
-    child.once("close", (code) => {
-      clearTimeout(timer);
-      resolve({ code, stderr });
-    });
+function capturedStream() {
+  const stream = new PassThrough();
+  let text = "";
+  stream.setEncoding("utf8");
+  stream.on("data", (chunk) => { text += chunk; });
+  return { stream, text: () => text };
+}
+
+async function pathExists(path) {
+  try {
+    await lstat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function createSyntheticBoundaryRoots() {
+  const createdRoot = await mkdtemp("/Users/Shared/andrew-agent-cache-boundary-");
+  let temporaryRoot;
+  try {
+    const root = await realpath(createdRoot);
+    await chmod(root, 0o700);
+    temporaryRoot = await mkdtemp("/tmp/andrew-agent-cache-boundary-");
+    await chmod(temporaryRoot, 0o700);
+    const roots = {
+      root,
+      temporaryRoot,
+      cache: join(root, "cache"),
+      home: join(root, "home"),
+      sibling: join(root, "sibling"),
+    };
+    await Promise.all(
+      [roots.cache, roots.home, roots.sibling].map((path) =>
+        mkdir(path, { recursive: true, mode: 0o700 }),
+      ),
+    );
+    return roots;
+  } catch (error) {
+    await rm(createdRoot, { recursive: true, force: true });
+    if (temporaryRoot !== undefined)
+      await rm(temporaryRoot, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+async function writeCacheBoundaryHelper(fixture, roots) {
+  const helper = join(fixture.target, "managed-cache-boundary.mjs");
+  const receipt = join(fixture.target, ".managed-cache-boundary-receipt.json");
+  const paths = {
+    repository: join(fixture.target, ".managed-cache-boundary-repository"),
+    temporary: join(roots.temporaryRoot, "managed-cache-boundary"),
+    cache: join(roots.cache, "managed-cache-boundary"),
+    home: join(roots.home, "managed-cache-boundary"),
+    sibling: join(roots.sibling, "managed-cache-boundary"),
+  };
+  await writeFile(
+    helper,
+    `import { mkdirSync, writeFileSync } from "node:fs";\nimport { dirname } from "node:path";\n\nconst paths = ${JSON.stringify(paths)};\nconst receipt = ${JSON.stringify(receipt)};\nconst result = {};\nfor (const [name, path] of Object.entries(paths)) {\n  try {\n    mkdirSync(dirname(path), { recursive: true });\n    writeFileSync(path, name + " canary\\n");\n    result[name] = "written";\n  } catch {\n    result[name] = "blocked";\n  }\n}\nwriteFileSync(receipt, JSON.stringify(result));\nprocess.stdout.write(JSON.stringify(result) + "\\n");\n`,
+  );
+  await execFile("git", ["-C", fixture.target, "add", helper]);
+  await execFile("git", ["-C", fixture.target, "commit", "--quiet", "-m", "add measurement helper"]);
+  return { receipt, paths };
+}
+
+async function runManagedCacheBoundaryMeasurement(
+  fixture,
+  codexBin,
+  additionalWritableRoot,
+) {
+  const { defaultCommandDependencies, runCommand } = await import(
+    new URL("../../dist/commands/run.js", import.meta.url).href
+  );
+  const environment = environmentFor(fixture, {
+    ANDREW_AGENT_CODEX_BIN: codexBin,
   });
+  const paths = await defaultCommandDependencies.resolveRuntimePaths({
+    env: environment,
+  });
+  const stdout = capturedStream();
+  const stderr = capturedStream();
+  const stdin = new PassThrough();
+  stdin.end();
+  let record;
+  let sandboxPolicy;
+  const dependencies = {
+    ...defaultCommandDependencies,
+    resolveRuntimePaths: async () => paths,
+    scratchParent: fixture.root,
+    async startNewThread(request, coordinator) {
+      const client = coordinator.client;
+      const measurementClient = {
+        threadStart: (params) => client.threadStart(params),
+        threadResume: (params) => client.threadResume(params),
+        threadRead: (params) => client.threadRead(params),
+        turnStart: (params) => {
+          const candidate =
+            additionalWritableRoot === undefined
+              ? params
+              : {
+                  ...params,
+                  sandboxPolicy: {
+                    ...params.sandboxPolicy,
+                    writableRoots: [
+                      ...params.sandboxPolicy.writableRoots,
+                      additionalWritableRoot,
+                    ],
+                  },
+                };
+          sandboxPolicy = candidate.sandboxPolicy;
+          return client.turnStart(candidate);
+        },
+        turnInterrupt: (params) => client.turnInterrupt(params),
+        respond: (id, result) => client.respond(id, result),
+        onNotification: (listener) => client.onNotification(listener),
+        onRequest: (listener) => client.onRequest(listener),
+        onFailure: (listener) => client.onFailure(listener),
+        close: () => client.close(),
+      };
+      record = await defaultCommandDependencies.startNewThread(request, {
+        ...coordinator,
+        client: measurementClient,
+      });
+      return record;
+    },
+  };
+  const code = await runCommand(
+    fixture.target,
+    "Run exactly `node ./managed-cache-boundary.mjs` once. Do not run any other command or modify any other file. Then reply only MEASUREMENT_DONE.",
+    { stdin, stdout: stdout.stream, stderr: stderr.stream },
+    dependencies,
+  );
+  const persistedRecord = record === undefined
+    ? undefined
+    : await defaultCommandDependencies.readThreadRecord(
+        paths.stateRoot,
+        record.threadId,
+        fixture.target,
+      );
+  return {
+    code,
+    persistedRecord,
+    sandboxPolicy,
+    stdout: stdout.text(),
+    stderr: stderr.text(),
+  };
 }
 
 test(
@@ -720,6 +726,110 @@ test(
       assert.match(second.stdout, /Terminal status: completed/, second.stdout);
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "live smoke: synthetic cache roots distinguish the current and narrow policies",
+  {
+    skip:
+      cacheBoundarySmokeRequested &&
+      process.env.ANDREW_AGENT_SMOKE_AUTH !== undefined
+        ? false
+        : "ANDREW_AGENT_CACHE_BOUNDARY_SMOKE or ANDREW_AGENT_SMOKE_AUTH is unset; the cache-boundary smoke did not run",
+    timeout: 600_000,
+  },
+  async () => {
+    const smokeCodexBin = await realpath(
+      process.env.ANDREW_AGENT_SMOKE_CODEX_BIN ?? "/nonexistent",
+    );
+    const version = await execFile(smokeCodexBin, ["--version"]);
+    assert.equal(version.stdout.trim(), `codex-cli ${REQUIRED_CODEX_VERSION}`);
+
+    for (const mode of ["current", "narrow-cache"]) {
+      const fixture = await createEnvironment();
+      let roots;
+      try {
+        roots = await createSyntheticBoundaryRoots();
+        const managedAuth = join(
+          fixture.stateRoot,
+          "codex-home",
+          ["auth", ".json"].join(""),
+        );
+        await copyFile(process.env.ANDREW_AGENT_SMOKE_AUTH, managedAuth);
+        await chmod(managedAuth, 0o600);
+        const helper = await writeCacheBoundaryHelper(fixture, roots);
+        const measurement = await runManagedCacheBoundaryMeasurement(
+          fixture,
+          smokeCodexBin,
+          mode === "narrow-cache" ? roots.cache : undefined,
+        );
+        const expected = {
+          repository: "written",
+          temporary: "written",
+          cache: mode === "narrow-cache" ? "written" : "blocked",
+          home: "blocked",
+          sibling: "blocked",
+        };
+
+        assert.equal(measurement.code, 0, "the managed run did not complete");
+        assert.ok(
+          measurement.persistedRecord,
+          "the real managed turn did not persist a readable record",
+        );
+        assert.equal(measurement.persistedRecord.terminalStatus, "completed");
+        assert.deepEqual(
+          JSON.parse(await readFile(helper.receipt, "utf8")),
+          expected,
+        );
+        assert.equal(await pathExists(helper.paths.repository), true);
+        assert.equal(await pathExists(helper.paths.temporary), true);
+        assert.equal(await pathExists(helper.paths.cache), mode === "narrow-cache");
+        assert.equal(await pathExists(helper.paths.home), false);
+        assert.equal(await pathExists(helper.paths.sibling), false);
+
+        assert.ok(
+          measurement.sandboxPolicy,
+          "the test wrapper did not observe a sandbox policy",
+        );
+        const expectedWritableRootCount = mode === "narrow-cache" ? 2 : 1;
+        const hasExpectedWritableRoots =
+          measurement.sandboxPolicy.writableRoots.length === expectedWritableRootCount &&
+          measurement.sandboxPolicy.writableRoots[0] === fixture.target &&
+          (mode !== "narrow-cache" ||
+            measurement.sandboxPolicy.writableRoots[1] === roots.cache);
+        assert.equal(
+          hasExpectedWritableRoots,
+          true,
+          "the turn did not use the expected writable-root roles",
+        );
+        assert.equal(measurement.sandboxPolicy.networkAccess, false);
+        assert.equal(measurement.sandboxPolicy.excludeTmpdirEnvVar, false);
+        assert.equal(measurement.sandboxPolicy.excludeSlashTmp, false);
+        assert.equal(
+          JSON.stringify(measurement.persistedRecord).includes(roots.root),
+          false,
+        );
+        assert.equal(
+          JSON.stringify(measurement.persistedRecord).includes(roots.temporaryRoot),
+          false,
+        );
+        assert.equal(measurement.stdout.includes(roots.root), false);
+        assert.equal(measurement.stdout.includes(roots.temporaryRoot), false);
+        assert.equal(measurement.stderr.includes(roots.root), false);
+        assert.equal(measurement.stderr.includes(roots.temporaryRoot), false);
+      } finally {
+        try {
+          if (roots !== undefined)
+            await Promise.all([
+              rm(roots.root, { recursive: true, force: true }),
+              rm(roots.temporaryRoot, { recursive: true, force: true }),
+            ]);
+        } finally {
+          await rm(fixture.root, { recursive: true, force: true });
+        }
+      }
     }
   },
 );

@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { Readable, Writable } from "node:stream";
-import test from "node:test";
+import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -37,8 +37,17 @@ function capture() {
   };
 }
 
+// Every fixture repository is removed when the file finishes, so a test that
+// forgets its own `rm` no longer leaves one behind in the system temporary
+// directory on each run.
+const createdRepositories = new Set();
+after(async () => {
+  for (const root of createdRepositories) await rm(root, { recursive: true, force: true });
+});
+
 async function createRepository() {
   const root = await realpath(await mkdtemp(join(tmpdir(), "andrew-agent-cli-repo-")));
+  createdRepositories.add(root);
   await execFile("git", ["init", "--quiet", root]);
   await execFile("git", ["-C", root, "config", "user.email", "test@example.invalid"]);
   await execFile("git", ["-C", root, "config", "user.name", "Test User"]);
@@ -65,10 +74,10 @@ async function createRepositoryWithGitlink() {
 }
 
 function terminalRecord(repositoryRoot, terminalStatus = "completed", grant = {}) {
-  // readThreadRecord always yields these two, migrating a pre-schema-2 record
-  // to the empty grant, so a fake that omitted them would not be a record the
-  // product can produce.
-  return { threadId: "thread-1", repositoryRoot, startingHead: "a".repeat(40), terminalHead: "b".repeat(40), bundleDigest: "c".repeat(64), productVersion: "0.1.0", codexVersion: "0.148.0", turnId: "turn-1", terminalStatus, finalGitStatus: "1 .M N... tracked.txt", requestedCapabilities: grant.requestedCapabilities ?? [], oracleRootDigest: grant.oracleRootDigest ?? null };
+  // readThreadRecord always yields the grant and the measurement, migrating an
+  // earlier record to the empty grant and no measurement, so a fake that
+  // omitted them would not be a record the product can produce.
+  return { threadId: "thread-1", repositoryRoot, startingHead: "a".repeat(40), terminalHead: "b".repeat(40), bundleDigest: "c".repeat(64), productVersion: "0.1.0", codexVersion: "0.148.0", turnId: "turn-1", terminalStatus, finalGitStatus: "1 .M N... tracked.txt", requestedCapabilities: grant.requestedCapabilities ?? [], oracleRootDigest: grant.oracleRootDigest ?? null, tokenUsage: grant.tokenUsage ?? null };
 }
 
 function operationHarness(repositoryRoot, overrides = {}) {
@@ -102,37 +111,137 @@ function operationHarness(repositoryRoot, overrides = {}) {
   return { order, dependencies };
 }
 
-test("compiled CLI exposes exact help and routes the four-command grammar", async () => {
+test("compiled CLI exposes exact help and routes the ten-command grammar", async () => {
   const { cliModule } = modules();
   const output = capture();
   const calls = [];
-  const handlers = { doctor: async () => { calls.push(["doctor"]); return 0; }, run: async (...args) => { calls.push(["run", ...args.slice(0, 2)]); return 0; }, resume: async (...args) => { calls.push(["resume", ...args.slice(0, 2)]); return 0; }, status: async (...args) => { calls.push(["status", ...args.slice(0, 1)]); return 0; } };
+  const handlers = { "clean-gone": async () => { calls.push(["clean-gone"]); return 0; }, commit: async (_io, format) => { calls.push(["commit", format]); return 0; }, doctor: async () => { calls.push(["doctor"]); return 0; }, drift: async () => { calls.push(["drift"]); return 0; }, pr: async (...args) => { calls.push(["pr", ...args.slice(0, 1)]); return 0; }, review: async (...args) => { calls.push(["review", args[0], args[2]]); return 0; }, triage: async (pullRequest) => { calls.push(["triage", pullRequest]); return 0; }, run: async (...args) => { calls.push(["run", ...args.slice(0, 2)]); return 0; }, resume: async (...args) => { calls.push(["resume", ...args.slice(0, 2)]); return 0; }, status: async (...args) => { calls.push(["status", ...args.slice(0, 1)]); return 0; } };
   assert.equal(await cliModule.main(["--help"], { ...output, handlers }), 0);
-  assert.equal(output.output().stdout, "Usage:\nandrew-agent doctor\nandrew-agent run <repository> <prompt>\nandrew-agent resume <thread-id> [prompt]\nandrew-agent status [thread-id]\n");
+  assert.equal(output.output().stdout, "Usage:\nandrew-agent clean-gone\nandrew-agent commit [--long | --short]\nandrew-agent doctor\nandrew-agent drift\nandrew-agent pr [base]\nandrew-agent review [--staged | base]\nandrew-agent run <repository> <prompt>\nandrew-agent resume <thread-id> [prompt]\nandrew-agent status [thread-id]\nandrew-agent triage <pr>\nandrew-agent verify-fix [base] [--with <path>]... [--test <path>]... -- <command> [args...]\n");
+  assert.equal(await cliModule.main(["clean-gone"], { ...capture(), handlers }), 0);
+  assert.equal(await cliModule.main(["commit"], { ...capture(), handlers }), 0);
+  assert.equal(await cliModule.main(["commit", "--long"], { ...capture(), handlers }), 0);
+  assert.equal(await cliModule.main(["commit", "--short"], { ...capture(), handlers }), 0);
   assert.equal(await cliModule.main(["doctor"], { ...capture(), handlers }), 0);
+  assert.equal(await cliModule.main(["drift"], { ...capture(), handlers }), 0);
+  assert.equal(await cliModule.main(["drift", "--"], { ...capture(), handlers }), 0);
+  assert.equal(await cliModule.main(["pr"], { ...capture(), handlers }), 0);
+  assert.equal(await cliModule.main(["pr", "origin/develop"], { ...capture(), handlers }), 0);
+  assert.equal(await cliModule.main(["review"], { ...capture(), handlers }), 0);
+  assert.equal(await cliModule.main(["review", "origin/develop"], { ...capture(), handlers }), 0);
+  assert.equal(await cliModule.main(["review", "--staged"], { ...capture(), handlers }), 0);
   assert.equal(await cliModule.main(["run", "/repo", "prompt"], { ...capture(), handlers }), 0);
   assert.equal(await cliModule.main(["resume", "thread-1"], { ...capture(), handlers }), 0);
   assert.equal(await cliModule.main(["resume", "thread-1", "next"], { ...capture(), handlers }), 0);
   assert.equal(await cliModule.main(["status"], { ...capture(), handlers }), 0);
   assert.equal(await cliModule.main(["status", "thread-1"], { ...capture(), handlers }), 0);
-  assert.deepEqual(calls, [["doctor"], ["run", "/repo", "prompt"], ["resume", "thread-1", undefined], ["resume", "thread-1", "next"], ["status", undefined], ["status", "thread-1"]]);
+  assert.equal(await cliModule.main(["triage", "81"], { ...capture(), handlers }), 0);
+  assert.deepEqual(calls, [["clean-gone"], ["commit", "long"], ["commit", "long"], ["commit", "short"], ["doctor"], ["drift"], ["drift"], ["pr", undefined], ["pr", "origin/develop"], ["review", undefined, false], ["review", "origin/develop", false], ["review", undefined, true], ["run", "/repo", "prompt"], ["resume", "thread-1", undefined], ["resume", "thread-1", "next"], ["status", undefined], ["status", "thread-1"], ["triage", 81]]);
 });
 
 test("command help exits before handlers and invalid grammar exits 2", async () => {
   const { cliModule } = modules();
   const calls = [];
-  const handlers = Object.fromEntries(["doctor", "run", "resume", "status"].map((name) => [name, async () => { calls.push(name); return 0; }]));
-  for (const [argv, usage] of [[["doctor", "-h"], "andrew-agent doctor"], [["run", "--help"], "andrew-agent run <repository> <prompt>"], [["resume", "-h"], "andrew-agent resume <thread-id> [prompt]"], [["status", "--help"], "andrew-agent status [thread-id]"]]) {
+  const handlers = Object.fromEntries(["clean-gone", "commit", "doctor", "drift", "pr", "review", "run", "resume", "status", "triage"].map((name) => [name, async () => { calls.push(name); return 0; }]));
+  const topLevelUsage = "Usage:\nandrew-agent clean-gone\nandrew-agent commit [--long | --short]\nandrew-agent doctor\nandrew-agent drift\nandrew-agent pr [base]\nandrew-agent review [--staged | base]\nandrew-agent run <repository> <prompt>\nandrew-agent resume <thread-id> [prompt]\nandrew-agent status [thread-id]\nandrew-agent triage <pr>\nandrew-agent verify-fix [base] [--with <path>]... [--test <path>]... -- <command> [args...]\n";
+  for (const [argv, usage] of [[["clean-gone", "-h"], "andrew-agent clean-gone"], [["commit", "-h"], "andrew-agent commit [--long | --short]"], [["doctor", "-h"], "andrew-agent doctor"], [["drift", "-h"], "andrew-agent drift"], [["pr", "-h"], "andrew-agent pr [base]"], [["review", "-h"], "andrew-agent review [--staged | base]"], [["run", "--help"], "andrew-agent run <repository> <prompt>"], [["resume", "-h"], "andrew-agent resume <thread-id> [prompt]"], [["status", "--help"], "andrew-agent status [thread-id]"], [["triage", "-h"], "andrew-agent triage <pr>"]]) {
     const output = capture();
     assert.equal(await cliModule.main(argv, { ...output, handlers }), 0);
     assert.equal(output.output().stdout, `Usage: ${usage}\n`);
   }
-  for (const argv of [[], ["unknown"], ["--bad"], ["doctor", "-hh"], ["doctor", "--help=true"], ["doctor", "extra"], ["run", "", "p"], ["run", "/r"], ["run", "/r", "p", "extra"], ["resume", ""], ["resume", "thread", ""], ["resume", "thread", "p", "extra"], ["status", "a", "b"], ["status", "--bad"]]) {
+  for (const [argv, expected] of [
+    [[], `Invalid command usage.\n${topLevelUsage}`],
+    [["unknown"], `Invalid command usage.\n${topLevelUsage}`],
+    [["--bad"], `Invalid command usage.\n${topLevelUsage}`],
+    [["clean-gone", "extra"], "Invalid command usage.\nUsage: andrew-agent clean-gone\n"],
+    [["clean-gone", "--long"], "Invalid command usage.\nUsage: andrew-agent clean-gone\n"],
+    [["clean-gone", "--staged"], "Invalid command usage.\nUsage: andrew-agent clean-gone\n"],
+    [["clean-gone", "--capability", "oracle"], "Invalid command usage.\nUsage: andrew-agent clean-gone\n"],
+    [["commit", "extra"], "Invalid command usage.\nUsage: andrew-agent commit [--long | --short]\n"],
+    [["commit", "--capability", "oracle"], "Invalid command usage.\nUsage: andrew-agent commit [--long | --short]\n"],
+    [["commit", "--long", "--short"], "Invalid command usage.\nUsage: andrew-agent commit [--long | --short]\n"],
+    [["commit", "--long=true"], "Invalid command usage.\nUsage: andrew-agent commit [--long | --short]\n"],
+    [["doctor", "--long"], "Invalid command usage.\nUsage: andrew-agent doctor\n"],
+    [["doctor", "-hh"], "Invalid command usage.\nUsage: andrew-agent doctor\n"],
+    [["doctor", "--help=true"], "Invalid command usage.\nUsage: andrew-agent doctor\n"],
+    [["doctor", "--bad"], "Invalid command usage.\nUsage: andrew-agent doctor\n"],
+    [["doctor", "extra"], "Invalid command usage.\nUsage: andrew-agent doctor\n"],
+    [["drift", "extra"], "Invalid command usage.\nUsage: andrew-agent drift\n"],
+    [["drift", "--", "extra"], "Invalid command usage.\nUsage: andrew-agent drift\n"],
+    [["drift", "--staged"], "Invalid command usage.\nUsage: andrew-agent drift\n"],
+    [["drift", "--long"], "Invalid command usage.\nUsage: andrew-agent drift\n"],
+    [["drift", "--capability", "oracle"], "Invalid command usage.\nUsage: andrew-agent drift\n"],
+    [["pr", "one", "two"], "Invalid command usage.\nUsage: andrew-agent pr [base]\n"],
+    [["pr", "--long"], "Invalid command usage.\nUsage: andrew-agent pr [base]\n"],
+    [["review", "one", "two"], "Invalid command usage.\nUsage: andrew-agent review [--staged | base]\n"],
+    [["review", "--long"], "Invalid command usage.\nUsage: andrew-agent review [--staged | base]\n"],
+    [["review", "--staged", "main"], "Invalid command usage.\nUsage: andrew-agent review [--staged | base]\n"],
+    [["review", "--staged=true"], "Invalid command usage.\nUsage: andrew-agent review [--staged | base]\n"],
+    [["commit", "--staged"], "Invalid command usage.\nUsage: andrew-agent commit [--long | --short]\n"],
+    [["pr", "--staged"], "Invalid command usage.\nUsage: andrew-agent pr [base]\n"],
+    [["run", "--bad"], "Invalid command usage.\nUsage: andrew-agent run <repository> <prompt>\n"],
+    [["run", "", "p"], "Invalid command usage.\nUsage: andrew-agent run <repository> <prompt>\n"],
+    [["run", "/r"], "Invalid command usage.\nUsage: andrew-agent run <repository> <prompt>\n"],
+    [["run", "/r", "p", "extra"], "Invalid command usage.\nUsage: andrew-agent run <repository> <prompt>\n"],
+    [["resume", "--bad"], "Invalid command usage.\nUsage: andrew-agent resume <thread-id> [prompt]\n"],
+    [["resume", ""], "Invalid command usage.\nUsage: andrew-agent resume <thread-id> [prompt]\n"],
+    [["resume", "thread", ""], "Invalid command usage.\nUsage: andrew-agent resume <thread-id> [prompt]\n"],
+    [["resume", "thread", "p", "extra"], "Invalid command usage.\nUsage: andrew-agent resume <thread-id> [prompt]\n"],
+    [["status", "a", "b"], "Invalid command usage.\nUsage: andrew-agent status [thread-id]\n"],
+    [["status", "--bad"], "Invalid command usage.\nUsage: andrew-agent status [thread-id]\n"],
+    [["triage"], "Invalid command usage.\nUsage: andrew-agent triage <pr>\n"],
+    [["triage", "0"], "Invalid command usage.\nUsage: andrew-agent triage <pr>\n"],
+    [["triage", "081"], "Invalid command usage.\nUsage: andrew-agent triage <pr>\n"],
+    [["triage", "-1"], "Invalid command usage.\nUsage: andrew-agent triage <pr>\n"],
+    [["triage", "12a"], "Invalid command usage.\nUsage: andrew-agent triage <pr>\n"],
+    [["triage", "2147483648"], "Invalid command usage.\nUsage: andrew-agent triage <pr>\n"],
+    [["triage", "1", "2"], "Invalid command usage.\nUsage: andrew-agent triage <pr>\n"],
+    [["triage", "--staged"], "Invalid command usage.\nUsage: andrew-agent triage <pr>\n"],
+    [["triage", "--capability", "oracle"], "Invalid command usage.\nUsage: andrew-agent triage <pr>\n"],
+  ]) {
     const output = capture();
     assert.equal(await cliModule.main(argv, { ...output, handlers }), 2, argv.join(" "));
-    assert.equal(output.output().stderr, "Invalid command usage.\n");
+    assert.equal(output.output().stderr, expected);
   }
   assert.deepEqual(calls, []);
+});
+
+test("verify-fix passes the command after the first double dash through unparsed", async () => {
+  const { cliModule } = modules();
+  const calls = [];
+  const handlers = { "verify-fix": async (options) => { calls.push(options); return 0; } };
+  const usage = "andrew-agent verify-fix [base] [--with <path>]... [--test <path>]... -- <command> [args...]";
+  assert.equal(await cliModule.main(["verify-fix", "--", "node", "--test", "--", "-x"], { ...capture(), handlers }), 0);
+  assert.equal(await cliModule.main(["verify-fix", "origin/develop", "--with", "node_modules", "--with", "vendor", "--test", "checks", "--", "pnpm", "test"], { ...capture(), handlers }), 0);
+  assert.deepEqual(calls, [
+    { withPaths: [], testPaths: [], command: ["node", "--test", "--", "-x"] },
+    { baseInput: "origin/develop", withPaths: ["node_modules", "vendor"], testPaths: ["checks"], command: ["pnpm", "test"] },
+  ]);
+  const help = capture();
+  assert.equal(await cliModule.main(["verify-fix", "--help"], { ...help, handlers }), 0);
+  assert.equal(help.output().stdout, `Usage: ${usage}\n`);
+  for (const argv of [
+    ["verify-fix"],
+    ["verify-fix", "node"],
+    ["verify-fix", "--"],
+    ["verify-fix", "--", ""],
+    ["verify-fix", "a", "b", "--", "node"],
+    ["verify-fix", "--with", "--", "node"],
+    ["verify-fix", "--with", "", "--", "node"],
+    ["verify-fix", "--with=vendor", "--", "node"],
+    ["verify-fix", "--test", "-x", "--", "node"],
+    ["verify-fix", "--staged", "--", "node"],
+    ["verify-fix", "--capability", "oracle", "--", "node"],
+    ["verify-fix", "--help", "--", "node"],
+    ["verify-fix", "-h", "main"],
+    ["review", "--with", "vendor"],
+    ["pr", "--test", "checks"],
+  ]) {
+    const output = capture();
+    assert.equal(await cliModule.main(argv, { ...output, handlers }), 2, argv.join(" "));
+    assert.match(output.output().stderr, /^Invalid command usage\.\nUsage: /);
+  }
+  assert.equal(calls.length, 2);
 });
 
 test("double dash preserves a dash-prefixed prompt", async () => {
@@ -198,11 +307,7 @@ test("a stalled real Writable times out, removes listeners, and still unlocks", 
     return terminalRecord(repositoryRoot);
   };
   const running = runModule.runCommand(repositoryRoot, "prompt", { ...capture(), stdout: stalled }, harness.dependencies);
-  const result = await Promise.race([
-    running,
-    new Promise((resolve) => setTimeout(() => resolve("test-timeout"), 1_500)),
-  ]);
-  assert.equal(result, 1);
+  assert.equal(await settleWithin(running, 30_000), 1);
   await new Promise((resolve) => setTimeout(resolve, 750));
   assert.equal(stalled.listenerCount("error"), initialErrorListeners);
   assert.deepEqual(harness.order.slice(-2), ["client-close", "unlock"]);
@@ -420,12 +525,14 @@ test("run rejects tracked and untracked dirt before runtime mutation", async (t)
   await writeFile(join(repositoryRoot, "tracked.txt"), "after\n");
   await writeFile(join(repositoryRoot, "untracked.txt"), "new\n");
   const beforeTracked = await readFile(join(repositoryRoot, "tracked.txt"));
+  const beforeUntracked = await readFile(join(repositoryRoot, "untracked.txt"));
   const beforeStatus = (await execFile("git", ["-C", repositoryRoot, "status", "--porcelain=v2", "--untracked-files=all"])).stdout;
   const stateRoot = join(repositoryRoot, "state-canary");
   const harness = operationHarness(repositoryRoot, { stateRoot });
   assert.equal(await runModule.runCommand(repositoryRoot, "prompt", capture(), harness.dependencies), 3);
   assert.deepEqual(harness.order, ["paths", "snapshot", "clean"]);
   assert.deepEqual(await readFile(join(repositoryRoot, "tracked.txt")), beforeTracked);
+  assert.deepEqual(await readFile(join(repositoryRoot, "untracked.txt")), beforeUntracked);
   assert.equal((await execFile("git", ["-C", repositoryRoot, "status", "--porcelain=v2", "--untracked-files=all"])).stdout, beforeStatus);
   await assert.rejects(readFile(stateRoot), { code: "ENOENT" });
 });
@@ -498,6 +605,24 @@ test("a readiness blocker names itself on stderr instead of one bare line", asyn
   assert.doesNotMatch(stderr, /OPTIONAL_ORACLE/);
 });
 
+test("readiness reports only the version blocker after skipped checks", async (t) => {
+  const { runModule } = modules();
+  const repositoryRoot = await createRepository();
+  t.after(() => rm(repositoryRoot, { recursive: true, force: true }));
+  const findings = [
+    { severity: "blocker", code: "CODEX_VERSION", message: "Resolved Codex version does not match codex-cli 0.167.0." },
+    { severity: "warning", code: "SCHEMA_COMPATIBILITY", message: "Codex schema compatibility was not evaluated because the pinned Codex version was unavailable." },
+    { severity: "warning", code: "STRICT_CONFIG", message: "Strict Codex configuration validation was not evaluated because the pinned Codex version was unavailable." },
+  ];
+  const harness = operationHarness(repositoryRoot, { doctorExit: 1, doctorFindings: findings });
+  const output = capture();
+  assert.equal(await runModule.runCommand(repositoryRoot, "prompt", output, harness.dependencies), 3);
+  assert.equal(
+    output.output().stderr,
+    "Candidate readiness failed: CODEX_VERSION.\n",
+  );
+});
+
 test("resume blames the path check, not thread lookup, when paths fail", async (t) => {
   const { resumeModule } = modules();
   const pathsModule = await import("../../dist/runtime/paths.js");
@@ -523,6 +648,49 @@ test("a preflight refusal names the check that refused", async (t) => {
   const output = capture();
   assert.equal(await runModule.runCommand(repositoryRoot, "prompt", output, harness.dependencies), 3);
   assert.match(output.output().stderr, /GIT_WORKTREE_DIRTY/);
+});
+
+test("a summarized dirty preflight escapes and bounds affected paths", async (t) => {
+  const { runModule } = modules();
+  const repositoryRoot = await createRepository();
+  t.after(() => rm(repositoryRoot, { recursive: true, force: true }));
+  const error = new gitModule.GitRuntimeError(
+    "GIT_WORKTREE_DIRTY",
+    "Git worktree is not clean.",
+  );
+  error.dirtyPathSummary = {
+    paths: ["line\nbreak.txt", `long-${"가".repeat(2_000)}.txt`],
+    omittedPathCount: 1,
+  };
+  const harness = operationHarness(repositoryRoot, {});
+  harness.dependencies.assertCleanGitSnapshot = () => {
+    throw error;
+  };
+  const output = capture();
+  assert.equal(await runModule.runCommand(repositoryRoot, "prompt", output, harness.dependencies), 3);
+  const { stderr } = output.output();
+  const [headline, paths] = stderr.trimEnd().split("\n");
+  assert.equal(headline, "Repository preflight failed: GIT_WORKTREE_DIRTY.");
+  assert.match(paths, /^Affected paths: line\\x0Abreak\.txt, long-/);
+  assert.match(paths, /\[truncated\]; 1 path\(s\) omitted\.$/);
+  assert.equal(Buffer.byteLength(paths, "utf8") <= 8 * 4_096, true);
+  assert.equal(stderr.includes(repositoryRoot), false);
+});
+
+test("a summarized dirty preflight bypasses an app-server phase fallback", () => {
+  const { runModule } = modules();
+  const error = new gitModule.GitRuntimeError(
+    "GIT_WORKTREE_DIRTY",
+    "Git worktree is not clean.",
+  );
+  error.dirtyPathSummary = {
+    paths: ["changed.txt"],
+    omittedPathCount: 0,
+  };
+  assert.equal(
+    runModule.diagnosticFor(error, "app-server"),
+    "Repository preflight failed: GIT_WORKTREE_DIRTY.\nAffected paths: changed.txt.",
+  );
 });
 
 test("resume reports a readiness blocker the same way run does", async (t) => {
@@ -835,7 +1003,7 @@ import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 const args = process.argv.slice(2);
-if (args[0] === "--version") { process.stdout.write("codex-cli 0.148.0\\n"); process.exit(0); }
+if (args[0] === "--version") { process.stdout.write("codex-cli 0.167.0\\n"); process.exit(0); }
 await mkdir(process.env.CODEX_HOME, { recursive: true });
 const marker = join(process.env.CODEX_HOME, "fake-server.log");
 await writeFile(join(process.env.CODEX_HOME, "fake-server.pid"), String(process.pid));
@@ -920,14 +1088,21 @@ async function seedThreadRecord(repositoryRoot, fixture) {
 }
 
 async function assertFakeServerCleanup(fixture) {
-  const childPid = Number(await readFile(join(fixture.codexHome, "fake-server.pid"), "utf8"));
+  const childPid = await readPositivePid(
+    join(fixture.codexHome, "fake-server.pid"),
+  );
   await waitFor(() => { assert.throws(() => process.kill(childPid, 0), { code: "ESRCH" }); return true; });
   await assert.rejects(lstat(join(fixture.stateRoot, "run.lock")), { code: "ENOENT" });
 }
 
 async function cleanupFakeAppServerFixture(fixture) {
   try {
-    const childPid = Number(await readFile(join(fixture.codexHome, "fake-server.pid"), "utf8"));
+    const pidPath = join(fixture.codexHome, "fake-server.pid");
+    const parsedPid = Number(await readFile(pidPath, "utf8"));
+    const childPid =
+      Number.isSafeInteger(parsedPid) && parsedPid > 0
+        ? parsedPid
+        : await readPositivePid(pidPath);
     try {
       process.kill(childPid, "SIGTERM");
     } catch (error) {
@@ -948,7 +1123,9 @@ function observeUnlockAfterChildExit(fixture) {
   const release = fixture.dependencies.releaseProcessLock;
   let calls = 0;
   fixture.dependencies.releaseProcessLock = async (handle) => {
-    const childPid = Number(await readFile(join(fixture.codexHome, "fake-server.pid"), "utf8"));
+    const childPid = await readPositivePid(
+      join(fixture.codexHome, "fake-server.pid"),
+    );
     assert.throws(() => process.kill(childPid, 0), { code: "ESRCH" });
     calls += 1;
     await release(handle);
@@ -976,7 +1153,8 @@ function observeClientCloseBeforeUnlock(fixture) {
   return () => assert.equal(closeCalls, 1);
 }
 
-async function waitFor(check, timeoutMs = 2_000) {
+// Every caller waits for a positive readiness or exit signal, so the cap only bounds how long a real failure takes to report; keep it far above observed load.
+async function waitFor(check, timeoutMs = 30_000) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
@@ -985,6 +1163,15 @@ async function waitFor(check, timeoutMs = 2_000) {
     if (Date.now() >= deadline) throw new Error("fixture timeout");
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+}
+
+async function readPositivePid(path) {
+  let pid;
+  await waitFor(async () => {
+    pid = Number(await readFile(path, "utf8"));
+    return Number.isSafeInteger(pid) && pid > 0;
+  });
+  return pid;
 }
 
 async function settleWithin(settlement, timeoutMs) {
@@ -999,6 +1186,22 @@ async function settleWithin(settlement, timeoutMs) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+// A run that never settles after its interrupts must fail with a message, not stall the file, so stop the fake server to let it settle before failing.
+async function settleInterruptedRun(running, fixture, label) {
+  const settlement = running.then(
+    (value) => ({ kind: "resolved", value }),
+    (error) => ({ kind: "rejected", error }),
+  );
+  const result = await settleWithin(settlement, 30_000);
+  if (result.kind === "timeout") {
+    await cleanupFakeAppServerFixture(fixture);
+    await settleWithin(settlement, 5_000);
+    throw new Error(`${label}: the interrupted run did not settle`);
+  }
+  if (result.kind === "rejected") throw result.error;
+  return result.value;
 }
 
 test("real command composition drives and reaps one fake App Server", async (t) => {
@@ -1024,7 +1227,9 @@ test("real command composition drives and reaps one fake App Server", async (t) 
   assert.equal((await execFile("git", ["-C", repositoryRoot, "remote"])).stdout, "");
   const log = await readFile(join(fixture.codexHome, "fake-server.log"), "utf8");
   assert.match(log, /^initialize\ninitialized\nthread\/start\nturn\/start\n$/);
-  const childPid = Number(await readFile(join(fixture.codexHome, "fake-server.pid"), "utf8"));
+  const childPid = await readPositivePid(
+    join(fixture.codexHome, "fake-server.pid"),
+  );
   await waitFor(() => { assert.throws(() => process.kill(childPid, 0), { code: "ESRCH" }); return true; });
   await assert.rejects(lstat(join(fixture.stateRoot, "run.lock")), { code: "ENOENT" });
 });
@@ -1099,7 +1304,8 @@ test("active fake-server exit persists failure before cleanup for run and resume
         (value) => ({ kind: "resolved", value }),
         (error) => ({ kind: "rejected", error }),
       );
-      let result = await settleWithin(settlement, 1_000);
+      // The signals below interrupt a live turn and settle at 130, so they must fire only on a real hang, never on a slow run.
+      let result = await settleWithin(settlement, 30_000);
       if (result.kind === "timeout") {
         process.emit("SIGINT");
         process.emit("SIGINT");
@@ -1170,7 +1376,7 @@ test("two interrupts settle a real fake-server turn at 130 without listeners or 
   process.emit("SIGINT");
   await waitFor(async () => (await readFile(join(fixture.codexHome, "fake-server.log"), "utf8")).includes("turn/interrupt"));
   process.emit("SIGINT");
-  assert.equal(await running, 130);
+  assert.equal(await settleInterruptedRun(running, fixture, "two interrupts"), 130);
   assert.equal(process.listenerCount("SIGINT"), listenersBefore);
   await assert.rejects(lstat(join(fixture.stateRoot, "run.lock")), { code: "ENOENT" });
   assert.match(await readFile(join(fixture.codexHome, "fake-server.log"), "utf8"), /turn\/interrupt/);
@@ -1186,7 +1392,7 @@ test("two pre-thread-start interrupts settle at 130 without a record or leaks", 
   await waitFor(async () => (await readFile(join(fixture.codexHome, "fake-server.log"), "utf8")).includes("thread/start"));
   process.emit("SIGINT");
   process.emit("SIGINT");
-  assert.equal(await running, 130);
+  assert.equal(await settleInterruptedRun(running, fixture, "two pre-thread-start interrupts"), 130);
   assert.equal(process.listenerCount("SIGINT"), listenersBefore);
   await assert.rejects(threadStoreModule.readThreadRecord(fixture.stateRoot, "thread-fake"), (error) => error.code === "THREAD_NOT_FOUND");
   await assertFakeServerCleanup(fixture);
@@ -1210,6 +1416,19 @@ test("package bin targets the executable compiled CLI", async () => {
   assert.equal(source.startsWith("#!/usr/bin/env node\n"), true);
   const { stdout } = await execFile(process.execPath, [fileURLToPath(new URL("../../dist/cli.js", import.meta.url)), "--help"]);
   assert.match(stdout, /andrew-agent run <repository> <prompt>/);
+});
+
+test("the compiled CLI runs when invoked through a symbolic link, as a global install does", async () => {
+  modules();
+  const root = await mkdtemp(join(tmpdir(), "andrew-agent-bin-"));
+  try {
+    const link = join(root, "andrew-agent");
+    await symlink(fileURLToPath(new URL("../../dist/cli.js", import.meta.url)), link);
+    const { stdout } = await execFile(process.execPath, [link, "--help"]);
+    assert.match(stdout, /andrew-agent commit \[--long \| --short\]/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("the capability flag is parsed, validated, and gated on its declared input", async () => {
@@ -1237,10 +1456,20 @@ test("the capability flag is parsed, validated, and gated on its declared input"
   // parseArgs rather than the dash guard, so these cases assert the outcome
   // and do not distinguish which of the two gates produced it.
   calls.length = 0;
+  const usageByCommand = {
+    doctor: "andrew-agent doctor",
+    run: "andrew-agent run <repository> <prompt>",
+    resume: "andrew-agent resume <thread-id> [prompt]",
+    status: "andrew-agent status [thread-id]",
+  };
   for (const argv of [["run", "--capability", "bogus", "/repo", "prompt"], ["run", "--capability=bogus", "/repo", "prompt"], ["run", "--capabilityx", "oracle", "/repo", "prompt"], ["run", "--capability-foo", "/repo", "prompt"], ["run", "-c", "oracle", "/repo", "prompt"], ["run", "--capability", "/repo", "prompt"], ["doctor", "--capability", "oracle"], ["status", "--capability", "oracle"], ["status", "thread-1", "--capability", "oracle"], ["run", "--capability", "ORACLE", "/repo", "prompt"], ["run", "--capability", "", "/repo", "prompt"]]) {
     const output = capture();
     assert.equal(await cliModule.main(argv, { ...output, handlers, env: oracleEnv }), 2, argv.join(" "));
-    assert.equal(output.output().stderr, "Invalid command usage.\n", argv.join(" "));
+    assert.equal(
+      output.output().stderr,
+      `Invalid command usage.\nUsage: ${usageByCommand[argv[0]]}\n`,
+      argv.join(" "),
+    );
   }
   assert.deepEqual(calls, []);
 
@@ -1488,4 +1717,18 @@ test("doctor evaluates the capability the environment offers and survives one it
   assert.equal(broken.code, 0);
   assert.deepEqual(inputs.map((input) => [input.requestedCapabilities, input.capabilityInputs]), [[[], {}]]);
   assert.equal(broken.stderr, "");
+});
+
+test("renders context usage only when the record carries a measurement", async () => {
+  const { runModule } = modules();
+  const render = async (tokenUsage) => {
+    const output = capture();
+    await runModule.renderLocalRecord({ ...terminalRecord("/repo"), tokenUsage }, output.stdout);
+    return output.output().stdout;
+  };
+  assert.match(await render({ totalTokens: 204000, contextWindow: 272000 }), /^Context usage: 204000 of 272000 tokens \(75%\)$/m);
+  assert.match(await render({ totalTokens: 1300, contextWindow: null }), /^Context usage: 1300 tokens$/m);
+  // A record from a run the App Server never measured, including one written
+  // before this field existed, reports no usage line rather than a placeholder.
+  assert.doesNotMatch(await render(null), /Context usage/);
 });
