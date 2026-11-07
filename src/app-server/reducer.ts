@@ -28,6 +28,13 @@ export interface TurnState {
   readonly omittedWarnings: number;
   readonly terminalInventoryDigest: string | null;
   readonly terminalStatus: "running" | "completed" | "failed" | "interrupted";
+  // The last measurement the App Server reported for this thread, or null
+  // when it reported none. `contextWindow` is null when the server did not
+  // name one, which leaves the total usable and the ratio undefined.
+  readonly tokenUsage: {
+    readonly totalTokens: number;
+    readonly contextWindow: number | null;
+  } | null;
 }
 
 // UTF-16 code units, unlike the renderer's escaped-byte bound. Every retained
@@ -38,6 +45,12 @@ const MAX_FIELD_LENGTH = 512;
 // Only a message is kept at the larger size, because it is the one value the
 // user reads in full and 512 cut real summaries mid-sentence.
 const MAX_MESSAGE_LENGTH = 4096;
+// Command output is content, not metadata like `command` and `cwd` beside it.
+// The renderer emits it across as many bounded lines as it needs once the
+// command completes, so retaining only a field's worth would discard what the
+// user asked to see. This is the one place that owns the retained size;
+// the renderer chunks whatever arrives and never restates the number.
+const MAX_COMMAND_OUTPUT_LENGTH = 4096;
 const MAX_ITEMS = 64;
 const MAX_OMITTED_ITEM_AUTHORITY = 64;
 const MAX_WARNINGS = 16;
@@ -359,7 +372,7 @@ function safeItem(item: unknown, phase: ItemState["phase"]): ItemState {
       exitCode: typeof raw.exitCode === "number" ? raw.exitCode : null,
       output:
         typeof raw.aggregatedOutput === "string"
-          ? bounded(raw.aggregatedOutput)
+          ? bounded(raw.aggregatedOutput, MAX_COMMAND_OUTPUT_LENGTH)
           : null,
     };
   } else if (type === "fileChange") {
@@ -386,8 +399,9 @@ function safeItem(item: unknown, phase: ItemState["phase"]): ItemState {
   } else if (type === "subAgentActivity") {
     value = {
       label: bounded(
-        `Subagent ${bounded(text(raw.kind) ?? "activity")}: ${bounded(text(raw.agentPath) ?? text(raw.agentThreadId) ?? "unknown")}`,
+        `Subagent: ${bounded(text(raw.agentPath) ?? text(raw.agentThreadId) ?? "unknown")}`,
       ),
+      activityKind: bounded(text(raw.kind) ?? "unknown"),
     };
   }
 
@@ -555,7 +569,16 @@ export function createTurnState(threadId: string, turnId: string): TurnState {
     omittedWarnings: 0,
     terminalInventoryDigest: null,
     terminalStatus: "running",
+    tokenUsage: null,
   };
+}
+
+function tokenCount(value: unknown, minimum = 0): number | null {
+  return typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= minimum
+    ? value
+    : null;
 }
 
 export function reduceServerMessage(
@@ -570,6 +593,18 @@ export function reduceServerMessage(
   if (Object.hasOwn(message, "id"))
     throw new ReducerError("UNKNOWN_SERVER_REQUEST");
   const params = isRecord(message.params) ? message.params : null;
+  // The App Server multiplexes a sub-agent's thread over the same connection,
+  // so the parent receives frames naming a thread it does not own. They were
+  // never this turn's to reduce, and dropping them preserves exactly what the
+  // identity checks below protect: no other thread's data enters this state.
+  // Throwing instead interrupted the parent turn the moment a subagent
+  // started; see docs/notes/2026-08-26-issue-24-instrumented-runs.md.
+  if (
+    params !== null &&
+    typeof params.threadId === "string" &&
+    params.threadId !== state.threadId
+  )
+    return state;
 
   if (message.method === "item/started") {
     if (!params) throw new ReducerError("INVALID_SERVER_EVENT");
@@ -635,7 +670,13 @@ export function reduceServerMessage(
       const previous = typeof value.output === "string" ? value.output : "";
       return {
         ...item,
-        value: { ...value, output: bounded(`${previous}${params.delta}`) },
+        value: {
+          ...value,
+          output: bounded(
+            `${previous}${params.delta}`,
+            MAX_COMMAND_OUTPUT_LENGTH,
+          ),
+        },
       };
     });
   }
@@ -707,6 +748,39 @@ export function reduceServerMessage(
     if (state.terminalStatus !== "running") return state;
     return { ...state, diff: bounded(params.diff) };
   }
+  if (message.method === "thread/tokenUsage/updated") {
+    // The one branch that never throws. Every other known method rejects a
+    // malformed frame, and that rejection reaches processNotification's catch,
+    // which calls failClosed() and interrupts the turn — the failure recorded
+    // in docs/notes/2026-08-26-issue-24-instrumented-runs.md. This value is
+    // informational, so anything unreadable leaves the last snapshot in place
+    // rather than costing the user the run.
+    if (
+      params === null ||
+      params.threadId !== state.threadId ||
+      params.turnId !== state.turnId ||
+      !isRecord(params.tokenUsage)
+    )
+      return state;
+    const usage = params.tokenUsage;
+    // `last`, not `total`. Every upstream completion re-sends the whole
+    // conversation, and `total` sums one breakdown per completion, so it
+    // climbs by the conversation's size each time and passes the window on a
+    // long turn: a real turn measured 26987, 54888, 84746 and 114924 against
+    // a 258400 window while it never held more than about 30000. `last` is
+    // the completion that is actually in the model's context.
+    const totalTokens = tokenCount(
+      isRecord(usage.last) ? usage.last.totalTokens : undefined,
+    );
+    if (totalTokens === null) return state;
+    return {
+      ...state,
+      tokenUsage: {
+        totalTokens,
+        contextWindow: tokenCount(usage.modelContextWindow, 1),
+      },
+    };
+  }
   if (message.method === "warning") {
     if (!params || typeof params.message !== "string")
       throw new ReducerError("INVALID_SERVER_EVENT");
@@ -725,8 +799,15 @@ export function reduceServerMessage(
     const turn = params.turn;
     if (
       turn.id !== state.turnId ||
-      (turn.itemsView !== "full" && turn.itemsView !== "summary") ||
-      !Array.isArray(turn.items)
+      (turn.itemsView !== "full" &&
+        turn.itemsView !== "summary" &&
+        turn.itemsView !== "notLoaded") ||
+      !Array.isArray(turn.items) ||
+      // A notLoaded view states that nothing was loaded, so items alongside it
+      // contradict the envelope. The settle path below never reads turn.items,
+      // which is the semantic a summary view asks for and would silently drop
+      // an inventory this one never claimed to carry.
+      (turn.itemsView === "notLoaded" && turn.items.length > 0)
     )
       throw new ReducerError("INVALID_SERVER_EVENT");
     const statuses: Record<string, TurnState["terminalStatus"]> = {
@@ -741,8 +822,15 @@ export function reduceServerMessage(
       throw new ReducerError("INVALID_SERVER_EVENT");
     // A summary view carries an authoritative status over an item list that
     // is not the turn's complete inventory, so it settles the status and
-    // leaves every inventory claim as observed while streaming.
-    if (turn.itemsView === "summary") {
+    // leaves every inventory claim as observed while streaming. A notLoaded
+    // view makes the same claim with nothing loaded at all, and it is what an
+    // interrupted turn's completion actually carries, measured against codex
+    // 0.148.0 on 2026-08-26. Rejecting it threw away the server's own
+    // terminal report, which reported a user's own interrupt as `failed`
+    // at exit 1 five seconds later rather than `interrupted` at 130, measured
+    // by interrupting the same live turn under both builds. So it settles the
+    // status here on the same terms and still contributes no inventory.
+    if (turn.itemsView === "summary" || turn.itemsView === "notLoaded") {
       // The retained inventory is carried straight to the renderer, so it has
       // to clear the same stored-state validation every other path applies.
       const settled: TurnState = {

@@ -58,19 +58,71 @@ test("keeps interleaved message and plan lifecycles by stable item ID", async ()
   assert.match(JSON.stringify([...state.items.values()]), /Plan B/);
 });
 
+test("retains subagent activity kind separately from the item lifecycle", () => {
+  const activity = item("subAgentActivity", "subagent-1", {
+    kind: "interrupted",
+    agentPath: "/root/helper",
+  });
+  const active = stateWith([started(activity)]);
+  const finished = reducer().reduceServerMessage(active, completed(activity));
+
+  assert.deepEqual(active.items.get("subagent-1"), {
+    id: "subagent-1",
+    type: "subAgentActivity",
+    phase: "started",
+    value: { label: "Subagent: /root/helper", activityKind: "interrupted" },
+  });
+  assert.deepEqual(finished.items.get("subagent-1"), {
+    id: "subagent-1",
+    type: "subAgentActivity",
+    phase: "completed",
+    value: { label: "Subagent: /root/helper", activityKind: "interrupted" },
+  });
+});
+
 test("rejects invalid event identity and type transitions without mutating state", () => {
   const api = reducer();
   const base = api.createTurnState("thread-1", "turn-1");
   const message = item("agentMessage", "message-1", { text: "", phase: null, memoryCitation: null });
   const active = api.reduceServerMessage(base, started(message));
   for (const malformed of [
-    { method: "item/agentMessage/delta", params: { threadId: "thread-2", turnId: "turn-1", itemId: "message-1", delta: "no" } },
+    { method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId: "turn-2", itemId: "message-1", delta: "no" } },
     { method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId: "turn-1", itemId: "missing", delta: "no" } },
     { method: "item/plan/delta", params: { threadId: "thread-1", turnId: "turn-1", itemId: "message-1", delta: "no" } },
   ]) {
     assert.throws(() => api.reduceServerMessage(active, malformed), { code: "INVALID_SERVER_EVENT" });
   }
   assert.deepEqual([...active.items.keys()], ["message-1"]);
+});
+
+// codex-cli 0.148.0 multiplexes a sub-agent's thread over the parent's
+// connection, so the parent receives frames naming a thread it does not own.
+// They are not this turn's to reduce, and throwing on them interrupted the
+// parent turn the moment a subagent started; see issue #24 and
+// docs/notes/2026-08-26-issue-24-instrumented-runs.md.
+test("drops notifications that name another thread", () => {
+  const api = reducer();
+  const message = item("agentMessage", "message-1", { text: "", phase: null, memoryCitation: null });
+  const active = api.reduceServerMessage(api.createTurnState("thread-1", "turn-1"), started(message));
+  for (const foreign of [
+    { method: "turn/started", params: { threadId: "thread-2", turn: { id: "turn-9", items: [], itemsView: "notLoaded", status: "inProgress", error: null, startedAt: null, completedAt: null, durationMs: null } } },
+    { method: "item/started", params: { threadId: "thread-2", turnId: "turn-9", startedAtMs: 1, item: item("reasoning", "thought-9", { summary: [], content: [] }) } },
+    { method: "item/completed", params: { threadId: "thread-2", turnId: "turn-9", completedAtMs: 2, item: item("agentMessage", "message-9", { text: "other thread", phase: null, memoryCitation: null }) } },
+    { method: "item/agentMessage/delta", params: { threadId: "thread-2", turnId: "turn-9", itemId: "message-9", delta: "no" } },
+    { method: "turn/completed", params: { threadId: "thread-2", turn: { id: "turn-9", items: [], itemsView: "summary", status: "completed", error: null, startedAt: null, completedAt: null, durationMs: null } } },
+  ]) {
+    assert.equal(api.reduceServerMessage(active, foreign), active, `${foreign.method} from another thread must leave the state untouched`);
+  }
+  assert.deepEqual([...active.items.keys()], ["message-1"], "a foreign thread must not add items to this turn");
+  assert.equal(active.terminalStatus, "running", "a foreign thread must not settle this turn");
+
+  assert.throws(
+    () => api.reduceServerMessage(active, { method: "item/started", params: { turnId: "turn-1", startedAtMs: 1, item: item("reasoning", "thought-1", { summary: [], content: [] }) } }),
+    { code: "INVALID_SERVER_EVENT" },
+    "a frame carrying no thread id cannot be attributed and stays fail-closed",
+  );
+  const warned = api.reduceServerMessage(active, { method: "warning", params: { threadId: null, message: "not thread-scoped" } });
+  assert.deepEqual(warned.warnings, ["not thread-scoped"], "an explicit null thread id means the frame is not thread-scoped, not foreign");
 });
 
 test("preserves authoritative completion and rejects conflicting terminal data", () => {
@@ -1210,12 +1262,38 @@ test("repeats a summary completion idempotently and rejects a changed one", () =
   assert.throws(() => api.reduceServerMessage(terminal, summaryCompletion({ status: "failed" })), { code: "INVALID_SERVER_EVENT" });
 });
 
-test("still rejects a completion whose items were never loaded", () => {
+// codex-cli 0.148.0 completes an interrupted turn with itemsView "notLoaded",
+// measured 2026-08-26: the status is authoritative and nothing was loaded, so
+// it settles on the same terms a summary view does.
+test("accepts a notLoaded completion as an authoritative status", () => {
+  const api = reducer();
+  const message = item("agentMessage", "message-1", { text: "ACKNOWLEDGED", phase: null, memoryCitation: null });
+  const streamed = stateWith([started(message), completed(message)]);
+
+  const terminal = api.reduceServerMessage(streamed, summaryCompletion({ itemsView: "notLoaded", status: "interrupted" }));
+
+  assert.equal(terminal.terminalStatus, "interrupted", "an interrupted turn's own completion has to settle the status");
+  assert.equal(terminal.terminalInventoryDigest, null, "a notLoaded view must not assert an inventory digest");
+  assert.equal(terminal.omittedItemsComplete, false, "a notLoaded view must not claim the omission set is complete");
+  assert.deepEqual([...terminal.items.keys()], ["message-1"], "items observed while streaming must survive a notLoaded completion");
+});
+
+test("rejects a notLoaded completion that contradicts itself with items", () => {
+  const api = reducer();
+  const carried = [item("agentMessage", "message-1", { text: "ACKNOWLEDGED", phase: null, memoryCitation: null })];
+  assert.throws(
+    () => api.reduceServerMessage(api.createTurnState("thread-1", "turn-1"), summaryCompletion({ itemsView: "notLoaded", items: carried })),
+    { code: "INVALID_SERVER_EVENT" },
+    "a view that loaded nothing must not arrive carrying an inventory the settle path would drop",
+  );
+});
+
+test("still rejects a completion whose items view is not declared", () => {
   const api = reducer();
   assert.throws(
-    () => api.reduceServerMessage(api.createTurnState("thread-1", "turn-1"), summaryCompletion({ itemsView: "notLoaded" })),
+    () => api.reduceServerMessage(api.createTurnState("thread-1", "turn-1"), summaryCompletion({ itemsView: "partial" })),
     { code: "INVALID_SERVER_EVENT" },
-    "notLoaded carries no observed inventory and stays fail-closed",
+    "an items view outside the generated union stays fail-closed",
   );
 });
 
@@ -1260,8 +1338,11 @@ test("refuses a summary completion whose retained inventory is corrupted", () =>
 
 // Raising the message bound must not raise every other retained field with it:
 // a turn can carry many long metadata values, and the renderer shows only a
-// bounded line of each regardless.
-test("only message text takes the larger retained bound", () => {
+// bounded line of each regardless. Command output is the one exception, and it
+// is content rather than metadata: the renderer emits it across as many bounded
+// lines as it needs once the command completes, so retaining a field's worth of
+// it would discard what the user asked to see.
+test("message text and command output take the larger retained bound", () => {
   const long = "x".repeat(5000);
   const state = stateWith([
     completed(item("agentMessage", "msg-1", { text: long })),
@@ -1275,14 +1356,75 @@ test("only message text takes the larger retained bound", () => {
   assert.ok(message.length <= 4096, `message kept ${message.length}`);
   const files = state.items.get("files-1").value.files[0];
   const command = state.items.get("cmd-1").value;
+  assert.ok(command.output.length > 512, `command output kept only ${command.output.length}`);
+  assert.ok(command.output.length <= 4096, `command output kept ${command.output.length}`);
   for (const [name, value] of [
     ["file path", files.path],
     ["file kind", files.kind],
     ["command", command.command],
     ["cwd", command.cwd],
-    ["output", command.output],
     ["subagent label", state.items.get("subagent-1").value.label],
+    ["subagent activity kind", state.items.get("subagent-1").value.activityKind],
     ["warning", state.warnings[0]],
   ])
     assert.ok(value.length <= 512, `${name} kept ${value.length}`);
+});
+
+// The completed item and the streaming deltas reach the retained value through
+// two different branches. They have to agree on the bound, or a long command
+// would grow past a field's worth while running and shrink when it finished.
+test("streaming command output accumulates under the command-output bound", () => {
+  const state = stateWith([
+    started(item("commandExecution", "cmd-1", { command: "npm test", cwd: "/repo", exitCode: null, aggregatedOutput: "" })),
+    ...Array.from({ length: 10 }, () => ({ method: "item/commandExecution/outputDelta", params: { threadId: "thread-1", turnId: "turn-1", itemId: "cmd-1", delta: "y".repeat(600) } })),
+  ]);
+  const output = state.items.get("cmd-1").value.output;
+  assert.ok(output.length > 512, `streaming output kept only ${output.length}`);
+  assert.ok(output.length <= 4096, `streaming output kept ${output.length}`);
+  assert.ok(output.endsWith("[truncated]"), "an over-long stream must carry the truncation marker");
+});
+
+function tokenUsageNotification(tokenUsage, identity = {}) {
+  return { method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId: "turn-1", ...identity, tokenUsage } };
+}
+
+const breakdown = (totalTokens) => ({ totalTokens, inputTokens: totalTokens, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 });
+
+test("measures context occupancy from the last completion, not the thread total", () => {
+  const api = reducer();
+  const base = api.createTurnState("thread-1", "turn-1");
+  assert.equal(base.tokenUsage, null);
+
+  // `total` accumulates one entry per upstream completion, and every
+  // completion re-sends the whole conversation, so it climbs by the
+  // conversation's size each time and passes the window on a long turn. A
+  // real turn measured 26987, 54888, 84746, 114924 against a 258400 window
+  // while it never held more than about 30000. `last` is the completion that
+  // is actually in the model's context.
+  const measured = api.reduceServerMessage(base, tokenUsageNotification({ total: breakdown(114924), last: breakdown(30178), modelContextWindow: 258400 }));
+  assert.deepEqual(measured.tokenUsage, { totalTokens: 30178, contextWindow: 258400 });
+
+  // A window the server does not report still yields a usable total.
+  const windowless = api.reduceServerMessage(measured, tokenUsageNotification({ last: breakdown(1300), modelContextWindow: null }));
+  assert.deepEqual(windowless.tokenUsage, { totalTokens: 1300, contextWindow: null });
+
+  // Every malformed shape keeps the last snapshot rather than throwing. A
+  // known method that throws reaches the coordinator's failClosed path and
+  // interrupts the turn, which is far worse than a stale usage line.
+  for (const malformed of [null, {}, { last: null }, { last: {} }, { total: breakdown(500) }, { last: { totalTokens: -1 } }, { last: { totalTokens: 1.5 } }, { last: { totalTokens: "many" } }, { last: { totalTokens: Number.MAX_SAFE_INTEGER + 2 } }])
+    assert.deepEqual(api.reduceServerMessage(measured, tokenUsageNotification(malformed)).tokenUsage, { totalTokens: 30178, contextWindow: 258400 }, JSON.stringify(malformed));
+  assert.deepEqual(api.reduceServerMessage(measured, { method: "thread/tokenUsage/updated" }).tokenUsage, { totalTokens: 30178, contextWindow: 258400 });
+
+  // An unusable window is dropped on its own terms, and the total survives.
+  assert.deepEqual(api.reduceServerMessage(measured, tokenUsageNotification({ last: breakdown(1300), modelContextWindow: 0 })).tokenUsage, { totalTokens: 1300, contextWindow: null });
+
+  // The frame must name this thread and this turn as strings. A missing or
+  // non-string identifier is a protocol violation, and this is the first
+  // branch where accepting one would write state.
+  for (const identity of [{ threadId: "thread-2" }, { turnId: "turn-2" }, { threadId: 1 }, { turnId: 1 }])
+    assert.deepEqual(api.reduceServerMessage(measured, tokenUsageNotification({ last: breakdown(9999), modelContextWindow: 258400 }, identity)).tokenUsage, { totalTokens: 30178, contextWindow: 258400 }, JSON.stringify(identity));
+  // A frame that names no turn at all is the case the earlier guard missed:
+  // it read a non-string turnId as "no mismatch" and attributed the frame to
+  // whichever turn was running.
+  assert.deepEqual(api.reduceServerMessage(measured, { method: "thread/tokenUsage/updated", params: { threadId: "thread-1", tokenUsage: { last: breakdown(9999), modelContextWindow: 258400 } } }).tokenUsage, { totalTokens: 30178, contextWindow: 258400 });
 });

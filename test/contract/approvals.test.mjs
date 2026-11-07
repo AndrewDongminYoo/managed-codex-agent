@@ -17,6 +17,16 @@ async function requests() {
     .map((line) => JSON.parse(line));
 }
 
+// Captured from the pinned binary rather than written from the generated
+// types, which are known to omit fields the binary sends. See
+// docs/notes/2026-09-03-approval-frame-capture.md.
+async function observed() {
+  return (await readFile("test/fixtures/protocol/approval-requests.observed.jsonl", "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+}
+
 function input(line, tty = true) {
   const stream = Readable.from(line === null ? [] : Array.isArray(line) ? line : [line]);
   Object.defineProperty(stream, "isTTY", { value: tty });
@@ -290,6 +300,24 @@ test("rejects extra generated-request keys and grants a fresh non-null permissio
   assert.equal(injectedResult.kind, "failClosed");
 });
 
+// codex-cli 0.148.0 sends availableDecisions on a command approval request and
+// the generated params type does not declare it, measured 2026-08-26 against a
+// real run. The server accepted a decision that field did not advertise, so the
+// key is allowed and the decision vocabulary is unchanged.
+test("accepts the command approval field the pinned binary sends beyond its generated type", async () => {
+  const [command] = await requests();
+  const advertised = structuredClone(command);
+  advertised.params.availableDecisions = ["accept", { acceptWithExecpolicyAmendment: { execpolicy_amendment: ["flutter", "test"] } }, "cancel"];
+
+  const prompted = await approvals().answerApproval(advertised, input("1\n"), output().stream, 100);
+  assert.equal(prompted.kind, "response");
+  assert.deepEqual(prompted.response, { decision: "accept" });
+
+  const noninteractive = await approvals().answerApproval(advertised, input("1\n", false), output().stream, 100);
+  assert.equal(noninteractive.kind, "response");
+  assert.deepEqual(noninteractive.response, { decision: "decline" }, "the safest answer stays decline against an advertised set that omits it");
+});
+
 test("renders complete bounded approval context and waits for a newline-delimited selection", async () => {
   const [command, , permission] = await requests();
   command.params.commandActions = [{
@@ -356,6 +384,44 @@ test("shows every generated command, network amendment, and filesystem entry dec
   await approvals().answerApproval(permission, input("3\n"), permissionSink.stream, 100);
   assert.match(permissionSink.text(), /fileSystem entry: read .*\/repo\/allowed/);
   assert.match(permissionSink.text(), /fileSystem entry: deny .*\/repo\/blocked\/\*\*/);
+});
+
+test("discloses beside each network amendment that the grant outlives the request", async () => {
+  const [command] = await requests();
+  command.params.proposedNetworkPolicyAmendments = [
+    { host: "a.example.com", action: "allow" },
+    { host: "b.example.com", action: "deny" },
+  ];
+  const sink = output();
+  const chosen = await approvals().answerApproval(command, input("5\n"), sink.stream, 100);
+  assert.deepEqual(chosen.response, { decision: { applyNetworkPolicyAmendment: { network_policy_amendment: { host: "b.example.com", action: "deny" } } } });
+  const text = sink.text();
+  const scope = "network amendment (applies to future requests): ";
+  assert.ok(text.includes(`${scope}allow a.example.com`), "allow entry carries the scope");
+  assert.ok(text.includes(`${scope}deny b.example.com`), "deny entry carries the scope");
+  assert.ok(text.indexOf(scope) < text.indexOf("1. Accept"), "scope is shown before the choices");
+  // The label keeps the host: with two amendments the host is the only thing
+  // that tells choice 4 from choice 5.
+  assert.match(text, /4\. Apply supplied network policy for a\.example\.com\n5\. Apply supplied network policy for b\.example\.com\n/);
+
+  // Moving the scope out of the label keeps the label budget where it was:
+  // a 62-byte host fills MAX_CHOICE_LABEL_BYTES exactly and still prompts,
+  // one more byte still declines without a prompt.
+  const limit = structuredClone(command);
+  const host = `${"h".repeat(50)}.example.com`;
+  assert.equal(Buffer.byteLength(host, "utf8"), 62);
+  limit.params.proposedNetworkPolicyAmendments = [{ host, action: "allow" }];
+  const limitSink = output();
+  const atLimit = await approvals().answerApproval(limit, input("4\n"), limitSink.stream, 100);
+  assert.equal(limitSink.calls(), 1);
+  assert.deepEqual(atLimit.response, { decision: { applyNetworkPolicyAmendment: { network_policy_amendment: { host, action: "allow" } } } });
+  assert.ok(limitSink.text().includes(`${scope}allow ${host}`));
+  const over = structuredClone(command);
+  over.params.proposedNetworkPolicyAmendments = [{ host: `h${host}`, action: "allow" }];
+  const overSink = output();
+  const declined = await approvals().answerApproval(over, input("4\n"), overSink.stream, 100);
+  assert.equal(overSink.calls(), 0);
+  assert.deepEqual(declined.response, { decision: "decline" });
 });
 
 test("visibly escapes terminal controls before approval prompt bounds", async () => {
@@ -1201,4 +1267,123 @@ test("fails closed without evaluating hostile direct JSON properties", async () 
     100,
   );
   assert.equal(acceptedResult.kind, "response");
+});
+
+// codex-cli 0.152.1 adds a required `kind` to the command approval params,
+// distinguishing a command from input written to an already-running terminal.
+// The validator's key allowlist did not carry it, so every command approval
+// the newly pinned server sends would have been classified malformed and
+// auto-declined — the fail-closed path, reached on well-formed traffic.
+test("accepts the approval kind the newly pinned binary sends, and names it in the prompt", async () => {
+  const [command] = await requests();
+
+  for (const kind of ["command", "writeStdin"]) {
+    const request = structuredClone(command);
+    request.params.kind = kind;
+    const out = output();
+    const result = await approvals().answerApproval(request, input("1\n"), out.stream, 100);
+    assert.equal(result.kind, "response", kind);
+    assert.deepEqual(result.response, { decision: "accept" }, kind);
+    // The human gate is the safety mechanism, so it has to say which of the
+    // two the user is approving.
+    assert.match(out.text(), new RegExp(`kind: ${kind}`), kind);
+  }
+
+  // An unrecognised kind is a shape this build does not understand, and the
+  // posture for that is refusal rather than a guess.
+  const unknown = structuredClone(command);
+  unknown.params.kind = "somethingElse";
+  assert.equal((await approvals().answerApproval(unknown, input("1\n"), output().stream, 100)).kind, "failClosed");
+
+  // Absent stays valid: the field's own documentation says older servers
+  // default it to `command`, and the allowlist is a subset check.
+  const absent = structuredClone(command);
+  delete absent.params.kind;
+  assert.equal((await approvals().answerApproval(absent, input("1\n"), output().stream, 100)).kind, "response");
+});
+
+// The hand-written frames were written at 0.148.0 and never refreshed when the
+// pin moved, which is why the deterministic layer saw nothing when 0.152.1
+// began sending `kind`. This case answers a frame the pinned binary actually
+// sent; docs/notes/2026-09-03-approval-frame-capture.md records the capture.
+test("answers a command approval captured from the pinned binary", async () => {
+  const [command] = await observed();
+  const sink = output();
+  const accepted = await approvals().answerApproval(command, input("1\n"), sink.stream, 100);
+  assert.deepEqual(accepted.response, { decision: "accept" });
+  // Three things only the observed frame carries: the request kind, a numeric
+  // request id, and a reason in the user's language, which must survive
+  // escaping and per-code-point byte accounting without being mangled.
+  assert.match(sink.text(), /^kind: command$/m);
+  assert.match(sink.text(), /^Request: 0$/m);
+  assert.match(sink.text(), /샌드박스에서 example\.com DNS/);
+  // The server proposes an execpolicy amendment and supplies its argv, so the
+  // user is offered it at 4 (issue #53; the frame carries no network
+  // amendment). The label states the scope, because the generated params type
+  // documents the amendment as allowing similar commands without prompting and
+  // the prompt is the only place the user learns that. Anchored on
+  // `Selection: ` so a sixth option cannot be appended past the match: without
+  // that tail the regex is a prefix and pins nothing.
+  assert.match(
+    sink.text(),
+    /1\. Accept\n2\. Accept for session\n3\. Decline\n4\. Apply supplied execpolicy amendment \(allows similar commands without prompting\)\n5\. Cancel\nSelection: $/,
+  );
+  // Displayed and granted must be the same argv, boundaries included. A
+  // token-sliced display drops the tail silently; a space-joined one erases
+  // the boundaries, so two different argvs render identically.
+  assert.match(
+    sink.text(),
+    new RegExp(
+      `^execpolicy amendment: ${JSON.stringify(command.params.proposedExecpolicyAmendment).replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
+      "m",
+    ),
+  );
+  for (const [left, right] of [
+    [["bash", "-c", "echo safe"], ["bash", "-c", "echo", "safe"]],
+  ]) {
+    const render = async (argv) => {
+      const frame = structuredClone(command);
+      frame.params.proposedExecpolicyAmendment = argv;
+      const pane = output();
+      await approvals().answerApproval(frame, input("4\n"), pane.stream, 100);
+      return pane.text().split("\n").find((line) => line.startsWith("execpolicy amendment:"));
+    };
+    assert.notEqual(await render(left), await render(right));
+  }
+  const amended = await approvals().answerApproval(command, input("4\n"), output().stream, 100);
+  assert.deepEqual(amended.response, {
+    decision: {
+      acceptWithExecpolicyAmendment: {
+        execpolicy_amendment: command.params.proposedExecpolicyAmendment,
+      },
+    },
+  });
+  assert.equal(amended.acceptedForSession, false);
+  // An argv too long to render is refused before any prompt, exactly as an
+  // over-long `command` is. Without this the user would be shown a cut
+  // display and grant the whole array; the observed argv is 79 bytes, so the
+  // display bound is unreachable in the case above and only this one covers it.
+  for (const argv of [
+    ["bash", "-c", `curl ${"x".repeat(300)}`],
+    Array.from({ length: 2000 }, () => "tok"),
+  ]) {
+    const oversized = structuredClone(command);
+    oversized.params.proposedExecpolicyAmendment = argv;
+    const pane = output();
+    const refused = await approvals().answerApproval(oversized, input("4\n"), pane.stream, 100);
+    assert.deepEqual(refused.response, { decision: "decline" });
+    assert.equal(pane.calls(), 0);
+  }
+
+  // The option appears only when the server proposes one: without it the
+  // user sees the same four choices as before, and Cancel is back at 4.
+  const withoutAmendment = structuredClone(command);
+  withoutAmendment.params.proposedExecpolicyAmendment = null;
+  const plain = output();
+  await approvals().answerApproval(withoutAmendment, input("4\n"), plain.stream, 100);
+  assert.match(
+    plain.text(),
+    /1\. Accept\n2\. Accept for session\n3\. Decline\n4\. Cancel\nSelection: $/,
+  );
+  assert.doesNotMatch(plain.text(), /execpolicy amendment:/);
 });

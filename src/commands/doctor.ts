@@ -16,6 +16,7 @@ import {
 } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
+import { codexContractDigest } from "../app-server/contract-digest.js";
 import { buildBundle, type BundleArtifact } from "../bundle/artifact.js";
 import {
   inspectInstallState,
@@ -25,7 +26,11 @@ import {
 } from "../bundle/install.js";
 import { parseBundleManifest } from "../bundle/manifest.js";
 import type { CapabilityInputs } from "../bundle/render.js";
-import { PRODUCT_VERSION, REQUIRED_CODEX_VERSION } from "../constants.js";
+import {
+  PRODUCT_VERSION,
+  REQUIRED_CODEX_CONTRACT_DIGEST,
+  REQUIRED_CODEX_VERSION,
+} from "../constants.js";
 import { readGitSnapshot, type GitSnapshot } from "../runtime/git.js";
 import { inspectProcessLock } from "../runtime/lock.js";
 import type { RuntimePaths } from "../runtime/paths.js";
@@ -66,6 +71,7 @@ const findingOrder = [
   "HOOK_READINESS",
   "INTERPRETER_READINESS",
   "STRICT_CONFIG",
+  "SANDBOX_BOUNDARY",
   "OPTIONAL_ORACLE",
   "OPTIONAL_SHARED_MEMORY",
   "PROCESS_LOCK",
@@ -75,6 +81,8 @@ const findingOrder = [
 
 type FindingCode = (typeof findingOrder)[number];
 type MutableFindings = Map<FindingCode, DiagnosticFinding>;
+type CodexVersionState =
+  "compatible" | "contract-mismatch" | "wrong-version" | "unavailable";
 const severityOrder = { blocker: 0, warning: 1, ready: 2 } as const;
 const maxChildOutputBytes = 64 * 1024;
 const maxAuthenticationBytes = 64 * 1024;
@@ -95,6 +103,14 @@ interface DoctorTestHooks {
     scratchRoot: string,
   ) => void | Promise<void>;
   readonly beforeVersionSpawn?: (codexHome: string) => void | Promise<void>;
+  readonly beforeContractSpawn?: (codexHome: string) => void | Promise<void>;
+  /**
+   * Digest the resolved binary must reproduce. A fake generator cannot emit
+   * the pinned contract, so tests substitute the digest of what theirs writes.
+   * It lives here rather than on DoctorDependencies so no production caller
+   * can disable the gate by passing one field.
+   */
+  readonly contractDigest?: string;
   readonly beforeStrictSpawn?: () => void | Promise<void>;
   readonly beforeMaterialization?: (shadowHome: string) => void | Promise<void>;
   readonly beforeScratchCleanup?: (scratchRoot: string) => void | Promise<void>;
@@ -135,6 +151,25 @@ async function runDoctorInternal(
 
   classifyProduct(dependencies, findings);
   classifyPlatform(dependencies, findings);
+  // Unconditional, like the two above it, and deliberately outside the fallible
+  // region below: a statement of the sandbox contract cannot fail, so it must
+  // not be able to reach ensureAllFindings unset and be reported as a
+  // diagnostic that "could not be completed". No path reaches that today —
+  // every diagnostic below catches its own failure — but the placement is what
+  // makes the guarantee, not the absence of a caller. The three facts are
+  // measured in docs/notes/2026-09-02-sandbox-boundary-measurement.md, and the
+  // boundary is named by class because a finding is terminal output and #23
+  // step 5 keeps personal paths out of it. Changing the policy in
+  // coordinator.ts means changing this sentence.
+  setReady(
+    findings,
+    "SANDBOX_BOUNDARY",
+    "A managed turn may write inside the target repository and /tmp, and " +
+      "nowhere else; network access is off. TMPDIR is unset in the managed " +
+      "child, so a tool that reads it falls back to /tmp, while one that " +
+      "resolves the Darwin per-user temporary directory is refused like any " +
+      "other path outside the boundary.",
+  );
 
   try {
     scratchRoot = await createScratchRoot(
@@ -219,7 +254,7 @@ async function runDoctorInternal(
 
     inspection = await classifyInstall(dependencies, findings);
     classifyDigest(candidate, inspection, findings);
-    const schemaCompatible =
+    const codexVersionState =
       !scratchReady || scratchRoot === undefined
         ? classifyUnavailableCodexVersion(findings)
         : await classifyCodexVersion(
@@ -249,7 +284,7 @@ async function runDoctorInternal(
     }
 
     if (
-      schemaCompatible &&
+      codexVersionState === "compatible" &&
       scratchRoot !== undefined &&
       inspection?.active !== null &&
       inspection !== undefined &&
@@ -262,12 +297,29 @@ async function runDoctorInternal(
         findings,
         hooks,
       );
+    } else if (codexVersionState === "contract-mismatch") {
+      setWarning(
+        findings,
+        "STRICT_CONFIG",
+        "Strict Codex configuration validation was not evaluated because the " +
+          "resolved Codex binary failed the contract check.",
+        `Reinstall codex-cli ${REQUIRED_CODEX_VERSION} from a trusted source ` +
+          "and retry.",
+      );
+    } else if (codexVersionState === "wrong-version") {
+      setWarning(
+        findings,
+        "STRICT_CONFIG",
+        "Strict Codex configuration validation was not evaluated because the " +
+          "pinned Codex version was unavailable.",
+        `Install codex-cli ${REQUIRED_CODEX_VERSION} and retry.`,
+      );
     } else {
       setBlocker(
         findings,
         "STRICT_CONFIG",
         "Strict Codex configuration validation could not run.",
-        schemaCompatible
+        codexVersionState === "compatible"
           ? "Restore a valid active installation before retrying."
           : `Install codex-cli ${REQUIRED_CODEX_VERSION} and retry.`,
       );
@@ -276,7 +328,7 @@ async function runDoctorInternal(
     setWarning(
       findings,
       "OPTIONAL_SHARED_MEMORY",
-      "Shared memory is unavailable in v0.1.",
+      "Shared memory is unavailable.",
       "Continue without shared memory.",
     );
     await classifyProcessLock(dependencies, findings);
@@ -615,21 +667,13 @@ async function classifyCodexVersion(
   scratchRoot: string,
   findings: MutableFindings,
   hooks: DoctorTestHooks,
-): Promise<boolean> {
+): Promise<CodexVersionState> {
   const expected = `codex-cli ${REQUIRED_CODEX_VERSION}`;
   try {
-    const versionHome = join(scratchRoot, "version-codex-home");
-    await mkdir(versionHome, { mode: 0o700 });
-    await chmod(versionHome, 0o700);
-    const metadata = await lstat(versionHome);
-    if (
-      !metadata.isDirectory() ||
-      metadata.isSymbolicLink() ||
-      metadata.uid !== currentUid() ||
-      (metadata.mode & 0o777) !== 0o700
-    ) {
-      throw new Error("unsafe version home");
-    }
+    const versionHome = await createIsolatedCodexHome(
+      scratchRoot,
+      "version-codex-home",
+    );
     await hooks.beforeVersionSpawn?.(versionHome);
     const result = await runBoundedChild(
       dependencies.paths.codexBin,
@@ -637,26 +681,38 @@ async function classifyCodexVersion(
       versionHome,
       dependencies.commandTimeoutMs,
     );
-    if (
-      result.exitCode === 0 &&
-      !result.timedOut &&
-      !result.outputExceeded &&
-      !result.residualDescendants &&
-      !result.groupCleanupFailed &&
-      result.stderr.length === 0 &&
-      result.stdout === `${expected}\n`
-    ) {
+    const safeVersionResult =
+      isSafeProbeResult(result) && result.stderr.length === 0;
+    if (safeVersionResult && result.stdout === `${expected}\n`) {
       setReady(
         findings,
         "CODEX_VERSION",
         "The resolved Codex version is supported.",
       );
-      setReady(
+      return (await classifyCodexContract(
+        dependencies,
+        scratchRoot,
+        findings,
+        hooks,
+      ))
+        ? "compatible"
+        : "contract-mismatch";
+    }
+    if (safeVersionResult && isCodexVersionReport(result.stdout)) {
+      setBlocker(
+        findings,
+        "CODEX_VERSION",
+        `Resolved Codex version does not match ${expected}.`,
+        `Install codex-cli ${REQUIRED_CODEX_VERSION} and retry.`,
+      );
+      setWarning(
         findings,
         "SCHEMA_COMPATIBILITY",
-        "The Codex schema version is compatible.",
+        "Codex schema compatibility was not evaluated because the pinned " +
+          "Codex version was unavailable.",
+        `Install codex-cli ${REQUIRED_CODEX_VERSION} and retry.`,
       );
-      return true;
+      return "wrong-version";
     }
   } catch {
     // The stable findings below intentionally hide child and exception details.
@@ -673,10 +729,118 @@ async function classifyCodexVersion(
     "Codex schema compatibility cannot be established.",
     `Install codex-cli ${REQUIRED_CODEX_VERSION} and retry.`,
   );
+  return "unavailable";
+}
+
+function isCodexVersionReport(value: string): boolean {
+  return /^codex-cli \d+\.\d+\.\d+\n$/.test(value);
+}
+
+/**
+ * Regenerates the app-server contract from the resolved binary and compares it
+ * against the digest the product was built against. The version string alone
+ * cannot carry this: a rebuilt binary reporting the pinned version can still
+ * add a required field, which the typed callers would then meet at runtime.
+ *
+ * Only reached once the version probe matched exactly, so a binary without the
+ * generator subcommands is already blocked by `CODEX_VERSION`. Never throws.
+ * Returns whether the contract matched, so a binary that failed this gate is
+ * not run again by the checks downstream of a compatible version.
+ */
+async function classifyCodexContract(
+  dependencies: DoctorDependencies,
+  scratchRoot: string,
+  findings: MutableFindings,
+  hooks: DoctorTestHooks,
+): Promise<boolean> {
+  const expected = hooks.contractDigest ?? REQUIRED_CODEX_CONTRACT_DIGEST;
+  try {
+    const contractHome = await createIsolatedCodexHome(
+      scratchRoot,
+      "contract-codex-home",
+    );
+    const roots = {
+      generated: join(scratchRoot, "contract-generated"),
+      schemas: join(scratchRoot, "contract-schemas"),
+    };
+    await hooks.beforeContractSpawn?.(contractHome);
+    for (const [subcommand, out] of [
+      ["generate-ts", roots.generated],
+      ["generate-json-schema", roots.schemas],
+    ] as const) {
+      const result = await runBoundedChild(
+        dependencies.paths.codexBin,
+        ["app-server", subcommand, "--out", out],
+        contractHome,
+        dependencies.commandTimeoutMs,
+      );
+      if (!isSafeProbeResult(result) || result.stderr.length !== 0) {
+        throw new Error("contract generation failed");
+      }
+    }
+    if ((await codexContractDigest(roots)) === expected) {
+      setReady(
+        findings,
+        "SCHEMA_COMPATIBILITY",
+        "The generated Codex app-server contract matches the pinned one.",
+      );
+      return true;
+    }
+    setBlocker(
+      findings,
+      "SCHEMA_COMPATIBILITY",
+      "The resolved Codex binary generates a different app-server contract " +
+        "than the pinned one.",
+      `Reinstall codex-cli ${REQUIRED_CODEX_VERSION} from a trusted source ` +
+        "and retry.",
+    );
+    return false;
+  } catch {
+    // The stable finding below intentionally hides child and exception details.
+  }
+  setBlocker(
+    findings,
+    "SCHEMA_COMPATIBILITY",
+    "Codex schema compatibility cannot be established.",
+    `Reinstall codex-cli ${REQUIRED_CODEX_VERSION} from a trusted source and ` +
+      "retry.",
+  );
   return false;
 }
 
-function classifyUnavailableCodexVersion(findings: MutableFindings): false {
+/** Owner-only scratch `CODEX_HOME` for one probe, rejected if it is not one. */
+async function createIsolatedCodexHome(
+  scratchRoot: string,
+  name: string,
+): Promise<string> {
+  const home = join(scratchRoot, name);
+  await mkdir(home, { mode: 0o700 });
+  await chmod(home, 0o700);
+  const metadata = await lstat(home);
+  if (
+    !metadata.isDirectory() ||
+    metadata.isSymbolicLink() ||
+    metadata.uid !== currentUid() ||
+    (metadata.mode & 0o777) !== 0o700
+  ) {
+    throw new Error("unsafe probe home");
+  }
+  return home;
+}
+
+function isSafeProbeResult(result: ChildResult): boolean {
+  return (
+    result.exitCode === 0 &&
+    !result.timedOut &&
+    !result.outputExceeded &&
+    !result.residualDescendants &&
+    !result.groupCleanupFailed
+  );
+}
+
+function classifyUnavailableCodexVersion(
+  findings: MutableFindings,
+): CodexVersionState {
   const expected = `codex-cli ${REQUIRED_CODEX_VERSION}`;
   setBlocker(
     findings,
@@ -690,7 +854,7 @@ function classifyUnavailableCodexVersion(findings: MutableFindings): false {
     "Codex schema compatibility cannot be established.",
     `Install codex-cli ${REQUIRED_CODEX_VERSION} and retry.`,
   );
-  return false;
+  return "unavailable";
 }
 
 async function classifyAuthentication(
@@ -902,19 +1066,30 @@ async function classifyStrictConfig(
       shadowHome,
       dependencies.commandTimeoutMs,
     );
-    if (
+    const boundedResult =
       !result.timedOut &&
       !result.outputExceeded &&
       !result.residualDescendants &&
-      !result.groupCleanupFailed &&
-      result.exitCode === 0
-    ) {
+      !result.groupCleanupFailed;
+    if (boundedResult && result.exitCode === 0) {
       setReady(
         findings,
         "STRICT_CONFIG",
         "Strict Codex configuration validation passed.",
       );
       return;
+    }
+    if (boundedResult && result.exitCode !== null) {
+      const diagnostic = parseStrictConfigDiagnostic(result.stderr);
+      if (diagnostic !== undefined) {
+        setBlocker(
+          findings,
+          "STRICT_CONFIG",
+          `Strict Codex configuration validation failed at ${diagnostic}.`,
+          "Resolve the managed portable configuration before retrying.",
+        );
+        return;
+      }
     }
   } catch {
     // The stable finding below intentionally hides config and child details.
@@ -925,6 +1100,17 @@ async function classifyStrictConfig(
     "Strict Codex configuration validation failed.",
     "Resolve the managed portable configuration before retrying.",
   );
+}
+
+function parseStrictConfigDiagnostic(stderr: string): string | undefined {
+  const matches = [
+    ...stderr.matchAll(
+      /^config\.toml:([1-9]\d{0,5}):([1-9]\d{0,5}): duplicate key$/gm,
+    ),
+  ];
+  if (matches.length !== 1) return undefined;
+  const [, line, column] = matches[0]!;
+  return `config.toml:${line!}:${column!} (duplicate key)`;
 }
 
 async function materializeActiveInventory(

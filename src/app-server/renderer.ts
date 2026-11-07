@@ -13,19 +13,18 @@ import {
 const MAX_RENDERED_VALUE = 512;
 // A completed message is emitted across as many bounded lines as it needs. The
 // cap exists for a value handed straight to the renderer, not for one the
-// reducer produced, so it has to clear anything the reducer retains: 4096
-// UTF-16 code units, at most 8 escaped bytes each (`\u{2028}` is the worst
-// measured), against the smallest chunk budget a maximal lifecycle prefix
-// leaves. A smaller cap would discard a message the product deliberately kept.
-const MAX_RETAINED_TEXT_BYTES = 4096 * 8;
+// reducer produced, so it has to clear anything the reducer retains. Each of
+// its 4096 UTF-16 code units can be a newline, producing one additional
+// structural line. A smaller cap would discard a message the product
+// deliberately kept.
+const MAX_RETAINED_TEXT_CODE_UNITS = 4096;
 const MIN_CHUNK_BUDGET = 64;
-const MAX_MESSAGE_LINES =
-  Math.ceil(MAX_RETAINED_TEXT_BYTES / MIN_CHUNK_BUDGET) + 1;
+const MAX_MESSAGE_LINES = MAX_RETAINED_TEXT_CODE_UNITS + 1;
 const TRUNCATION_MARKER = " [truncated]";
 const MAX_RENDERED_PROTOCOL_PART = 128;
 const PROTOCOL_ID_DIGEST_LENGTH = 16;
 const PROTOCOL_ID_HASH_CHUNK_CODE_UNITS = 4096;
-const completedTextItemLines = new WeakMap<ItemState, readonly string[]>();
+const completedItemLines = new WeakMap<ItemState, readonly string[]>();
 
 function bounded(value: string, limit = MAX_RENDERED_VALUE): string {
   return boundedTerminalText(value, limit, TRUNCATION_MARKER);
@@ -70,25 +69,40 @@ function valueText(value: unknown, key: string): string | null {
 }
 
 // The whole message reaches the user, but never as one unbounded write:
-// it is split on character boundaries into lines that each satisfy the same
-// byte bound as every other rendered line. Escaping happens per part and the
-// walk stops at the line cap, so a hostile value is never materialised — the
+// newlines form structural line boundaries, and long segments split on
+// character boundaries. Every resulting line satisfies the same byte bound as
+// other rendered output. Escaping happens per non-newline part and the walk
+// stops at the line cap, so a hostile value is never materialised — the
 // property `boundedTerminalText` exists to hold.
 function messageLines(lifecycle: string, text: string): readonly string[] {
   const chunks: string[] = [];
   let current = "";
   let bytes = 0;
+  let truncated = false;
   const budget = Math.max(
     MIN_CHUNK_BUDGET,
     MAX_RENDERED_VALUE - Buffer.byteLength(lifecycle, "utf8") - 16,
   );
   for (const part of text) {
+    if (part === "\n") {
+      if (chunks.length + 1 === MAX_MESSAGE_LINES) {
+        chunks.push(`${current}${TRUNCATION_MARKER}`);
+        current = "";
+        truncated = true;
+        break;
+      }
+      chunks.push(current);
+      current = "";
+      bytes = 0;
+      continue;
+    }
     const escaped = escapeTerminalPart(part);
     const size = Buffer.byteLength(escaped, "utf8");
     if (bytes + size > budget) {
       if (chunks.length + 1 === MAX_MESSAGE_LINES) {
         chunks.push(`${current}${TRUNCATION_MARKER}`);
         current = "";
+        truncated = true;
         break;
       }
       chunks.push(current);
@@ -98,7 +112,11 @@ function messageLines(lifecycle: string, text: string): readonly string[] {
     current += escaped;
     bytes += size;
   }
-  if (current !== "") chunks.push(current);
+  if (
+    !truncated &&
+    (current !== "" || chunks.length === 0 || text.endsWith("\n"))
+  )
+    chunks.push(current);
   if (chunks.length <= 1) return [bounded(`${lifecycle}: ${chunks[0] ?? ""}`)];
   // Every line repeats the lifecycle and carries its own ordinal, because
   // reportTurnState skips a line it has already written keyed on the whole
@@ -111,11 +129,14 @@ function messageLines(lifecycle: string, text: string): readonly string[] {
 
 function renderItem(item: ItemState, settled: boolean): readonly string[] {
   const textItem = item.type === "agentMessage" || item.type === "plan";
-  if (textItem && item.phase === "completed") {
-    const cached = completedTextItemLines.get(item);
+  // Only a completed item is ever cached, and only the branches below put one
+  // there, so the phase check alone is the whole guard.
+  if (item.phase === "completed") {
+    const cached = completedItemLines.get(item);
     if (cached !== undefined) return cached;
   }
-  const lifecycle = `${renderedItemId(item.id)} ${bounded(item.type, MAX_RENDERED_PROTOCOL_PART)} ${item.phase}`;
+  const itemId = renderedItemId(item.id);
+  const lifecycle = `${itemId} ${bounded(item.type, MAX_RENDERED_PROTOCOL_PART)} ${item.phase}`;
   // While a text item is still streaming its own value is a growing prefix of
   // the final one, and rendering it produced a near-identical line per delta.
   // `reasoning` below already renders a constant in flight; these do the same,
@@ -132,7 +153,7 @@ function renderItem(item: ItemState, settled: boolean): readonly string[] {
       ];
     const text = record(item.value)?.text;
     const lines = messageLines(lifecycle, typeof text === "string" ? text : "");
-    if (item.phase === "completed") completedTextItemLines.set(item, lines);
+    if (item.phase === "completed") completedItemLines.set(item, lines);
     return lines;
   }
   if (item.type === "reasoning")
@@ -141,13 +162,32 @@ function renderItem(item: ItemState, settled: boolean): readonly string[] {
     const command = valueText(item.value, "command") ?? "command";
     const cwd = valueText(item.value, "cwd") ?? "unknown cwd";
     const exitCode = record(item.value)?.exitCode;
-    const output = valueText(item.value, "output");
+    // Read the retained value, not `valueText`: that helper returns text the
+    // terminal escaping has already been applied to, in which a newline is the
+    // four characters of `\x0A` and there is nothing structural left to split.
+    const rawOutput = record(item.value)?.output;
+    const output = typeof rawOutput === "string" ? rawOutput : "";
     const lines = [
       bounded(
         `${lifecycle}: ${command} (${cwd}), exit ${typeof exitCode === "number" ? exitCode : "pending"}`,
       ),
     ];
-    if (output) lines.push(bounded(`Command output: ${output}`));
+    // The item id carries because reportTurnState skips a line it has already
+    // written keyed on the whole string, and an output line named by its text
+    // alone is identical between two commands that printed the same thing: the
+    // second command's output was dropped entirely.
+    const outputLifecycle = `${itemId} Command output`;
+    // A chunk's ordinal names the total, so a total that grows with every
+    // delta would rewrite each earlier line and defeat that same skip. The
+    // split therefore waits until the output stops changing; while it streams
+    // the value keeps its single bounded line.
+    if (output)
+      lines.push(
+        ...(item.phase === "completed"
+          ? messageLines(outputLifecycle, output)
+          : [bounded(`${outputLifecycle}: ${output}`)]),
+      );
+    if (item.phase === "completed") completedItemLines.set(item, lines);
     return lines;
   }
   if (item.type === "fileChange") {
@@ -179,7 +219,7 @@ function renderItem(item: ItemState, settled: boolean): readonly string[] {
   if (item.type === "subAgentActivity")
     return [
       bounded(
-        `${lifecycle}: ${valueText(item.value, "label") ?? "Subagent activity"}`,
+        `${lifecycle}: ${valueText(item.value, "label") ?? "Subagent activity"} (activity: ${valueText(item.value, "activityKind") ?? "unknown"})`,
       ),
     ];
   return [
@@ -187,6 +227,28 @@ function renderItem(item: ItemState, settled: boolean): readonly string[] {
       `${lifecycle}: ${valueText(item.value, "label") ?? "Item updated"}`,
     ),
   ];
+}
+
+// The one place that formats a measurement, because the live turn output and
+// the persisted record both report it and a second template would drift.
+// Only integers ever reach the line, so it needs no escaping and no bound.
+// Anything else renders nothing rather than being printed unescaped.
+export function formatTokenUsage(usage: unknown): string | null {
+  const source = record(usage);
+  const total = tokenCount(source?.totalTokens);
+  if (total === null) return null;
+  const window = tokenCount(source?.contextWindow, 1);
+  return window === null
+    ? `Context usage: ${total} tokens`
+    : `Context usage: ${total} of ${window} tokens (${Math.floor((total / window) * 100)}%)`;
+}
+
+function tokenCount(value: unknown, minimum = 0): number | null {
+  return typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= minimum
+    ? value
+    : null;
 }
 
 export function renderTurnState(state: TurnState): readonly string[] {
@@ -226,6 +288,10 @@ export function renderTurnState(state: TurnState): readonly string[] {
     omissions.omittedWarnings > 0
   )
     lines.push(`${omissions.omittedWarnings} warning(s) omitted`);
+  const usage = formatTokenUsage(
+    (state as TurnState & { readonly tokenUsage?: unknown }).tokenUsage,
+  );
+  if (usage !== null) lines.push(usage);
   lines.push(bounded(`Terminal status: ${state.terminalStatus}`));
   return lines;
 }

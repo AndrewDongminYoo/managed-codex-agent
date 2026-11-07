@@ -26,8 +26,24 @@ const doctorModule = await import("../../dist/commands/doctor.js").catch(
 const artifactModule = await import("../../dist/bundle/artifact.js");
 const installModule = await import("../../dist/bundle/install.js");
 const lockModule = await import("../../dist/runtime/lock.js");
+const constantsModule = await import("../../dist/constants.js");
 const sourceFixture = new URL("../fixtures/source-codex/clean/", import.meta.url);
 const authFileName = ["auth", ".json"].join("");
+const contractModule = await import("../../dist/app-server/contract-digest.js");
+
+// The fake generator's entire output. The real generator writes about 7 MiB
+// that no shell fixture can reproduce, so the fixture digests these bytes and
+// injects the result as the expected digest; doctor then compares what the fake
+// wrote against what the fixture computed, exactly as it does in production
+// against REQUIRED_CODEX_CONTRACT_DIGEST.
+const fakeContract = {
+  generated: { "v2/Thread.ts": "export interface Thread {}\n" },
+  schemas: { "v2/Thread.json": '{"title":"Thread"}\n' },
+};
+const driftedContract = {
+  generated: { "v2/Thread.ts": "export interface Thread { kind: string }\n" },
+  schemas: fakeContract.schemas,
+};
 
 const findingOrder = [
   "PRODUCT_VERSION",
@@ -46,6 +62,7 @@ const findingOrder = [
   "HOOK_READINESS",
   "INTERPRETER_READINESS",
   "STRICT_CONFIG",
+  "SANDBOX_BOUNDARY",
   "OPTIONAL_ORACLE",
   "OPTIONAL_SHARED_MEMORY",
   "PROCESS_LOCK",
@@ -179,6 +196,10 @@ async function createFixture(options = {}) {
 
   const codexBin = join(binRoot, "codex");
   await writeCodexExecutable(codexBin, options.codex ?? {});
+  const expectedContractDigest = await materializeFakeTrees(
+    join(root, "expected-contract"),
+    fakeContract,
+  );
   const paths = { sourceRoot, stateRoot, codexHome: join(stateRoot, "codex-home"), codexBin };
   const buildInput = {
     sourceRoot,
@@ -201,7 +222,7 @@ async function createFixture(options = {}) {
     paths,
     scratchParent,
     dependencies: {
-      productVersion: "0.1.0",
+      productVersion: constantsModule.PRODUCT_VERSION,
       platform: "darwin",
       platformVersion: "15.6.1",
       paths,
@@ -209,15 +230,49 @@ async function createFixture(options = {}) {
       requestedCapabilities: [],
       capabilityInputs: {},
       scratchParent,
-      commandTimeoutMs: 500,
+      commandTimeoutMs: 2000,
     },
+    expectedContractDigest,
   };
 }
 
+// PATH inside the probe holds only Node's own directory, so every external
+// command needs an absolute path; redirection and printf are shell builtins.
+function writeFakeTree(files) {
+  return Object.entries(files)
+    .map(([path, contents]) => {
+      assert.equal(contents.includes("'"), false, "fake contract bytes must not need sh quoting");
+      const directory = dirname(path);
+      const parent = directory === "." ? "" : `/bin/mkdir -p "$4/${directory}"\n`;
+      return `${parent}printf '%s' '${contents}' > "$4/${path}"`;
+    })
+    .join("\n");
+}
+
+// Materializes the same bytes the fake writes, so the fixture can pin the
+// digest doctor must reproduce without duplicating the shell script's logic.
+async function materializeFakeTrees(root, files) {
+  for (const [tree, entries] of Object.entries(files)) {
+    for (const [path, contents] of Object.entries(entries)) {
+      const absolute = join(root, tree, path);
+      await mkdir(dirname(absolute), { recursive: true });
+      await writeFile(absolute, contents);
+    }
+  }
+  return contractModule.codexContractDigest({
+    generated: join(root, "generated"),
+    schemas: join(root, "schemas"),
+  });
+}
+
 async function writeCodexExecutable(path, options = {}) {
-  const version = options.version ?? "codex-cli 0.148.0";
+  const version = options.version ?? "codex-cli 0.167.0";
   const strict = options.strict ?? "success";
   const markerPath = options.markerPath;
+  const strictDiagnostic =
+    options.strictDiagnostic === undefined
+      ? ""
+      : `printf '%s\\n' ${JSON.stringify(options.strictDiagnostic)} >&2`;
   const invocationMarker =
     markerPath === undefined
       ? ""
@@ -240,6 +295,19 @@ printf '%s\\n' ${JSON.stringify(version)}`
 printf '%s\\n' "$!" > ${JSON.stringify(markerPath)}
 printf '%s\\n' ${JSON.stringify(version)}`
             : `printf '%s\\n' ${JSON.stringify(version)}`;
+  const contract = options.contract ?? "success";
+  const contractFiles = contract === "drift" ? driftedContract : fakeContract;
+  const contractBody =
+    contract === "failure"
+      ? "exit 41"
+      : `/bin/mkdir -p "$4"
+if [ "$2" = "generate-ts" ]; then
+${writeFakeTree(contractFiles.generated)}
+fi
+if [ "$2" = "generate-json-schema" ]; then
+${writeFakeTree(contractFiles.schemas)}
+fi
+exit 0`;
   const strictBody =
     strict === "timeout"
       ? "trap '' TERM\nwhile :; do :; done"
@@ -266,7 +334,11 @@ ${versionBody}
   exit 0
 fi
 if [ "$1" = "app-server" ] && [ "$2" = "--strict-config" ] && [ "$3" = "--listen" ] && [ "$4" = "stdio://" ] && [ "$#" = "4" ]; then
+${strictDiagnostic}
 ${strictBody}
+fi
+if [ "$1" = "app-server" ] && [ "$3" = "--out" ] && [ "$#" = "4" ]; then
+${contractBody}
 fi
 exit 24
 `,
@@ -331,10 +403,12 @@ async function runUnchanged(fixture, overrides = {}, hooks) {
     ...fixture.dependencies,
     ...overrides,
   };
-  const result =
-    hooks === undefined
-      ? await requireDoctor().runDoctor(dependencies)
-      : await requireDoctor().__runDoctorForTests(dependencies, hooks);
+  // The digest override is a test hook rather than a dependency, so every
+  // invocation goes through the hook-bearing entry point.
+  const result = await requireDoctor().__runDoctorForTests(dependencies, {
+    contractDigest: fixture.expectedContractDigest,
+    ...hooks,
+  });
   assert.deepEqual(await snapshotTree(fixture.paths.sourceRoot), sourceBefore);
   assert.deepEqual(await snapshotTree(fixture.paths.stateRoot), stateBefore);
   assert.deepEqual(await snapshotTree(fixture.scratchParent), scratchBefore);
@@ -386,7 +460,10 @@ async function withFixture(options, run) {
   }
 }
 
-async function runDoctorIsolated(fixture, timeoutMs = 2000) {
+// The bound is a hang guard, not a speed check: one doctor run spawns several
+// children, each allowed the fixture's 2000 ms `commandTimeoutMs`, so a bound
+// equal to one child's budget reported a slow but live run as a hang.
+async function runDoctorIsolated(fixture, timeoutMs = 30_000) {
   const script = join(fixture.root, "isolated-doctor.mjs");
   await writeFile(
     script,
@@ -433,7 +510,12 @@ test("reports a fully ready base installation with optional warnings", async () 
       [...findingOrder].sort(),
     );
     assert.equal(finding(result, "OPTIONAL_ORACLE").severity, "warning");
-    assert.equal(finding(result, "OPTIONAL_SHARED_MEMORY").severity, "warning");
+    assert.deepEqual(finding(result, "OPTIONAL_SHARED_MEMORY"), {
+      severity: "warning",
+      code: "OPTIONAL_SHARED_MEMORY",
+      message: "Shared memory is unavailable.",
+      remediation: "Continue without shared memory.",
+    });
     for (const entry of result.findings.filter(
       (value) => !value.code.startsWith("OPTIONAL_"),
     )) {
@@ -592,23 +674,125 @@ test("classifies missing and drifted active installations", async (t) => {
 });
 
 test("uses exact Codex version and schema compatibility", async () => {
-  await withFixture({ codex: { version: "codex-cli 0.149.0" } }, async (fixture) => {
+  await withFixture({ codex: { version: "codex-cli 0.149.0", strict: "failure" } }, async (fixture) => {
     let strictSpawns = 0;
+    let contractSpawns = 0;
     const result = await runUnchanged(fixture, {}, {
       beforeStrictSpawn() {
         strictSpawns += 1;
+      },
+      beforeContractSpawn() {
+        contractSpawns += 1;
       },
     });
     assert.equal(result.exitCode, 1);
     assert.deepEqual(finding(result, "CODEX_VERSION"), {
       severity: "blocker",
       code: "CODEX_VERSION",
-      message: "Resolved Codex version does not match codex-cli 0.148.0.",
-      remediation: "Install codex-cli 0.148.0 and retry.",
+      message: "Resolved Codex version does not match codex-cli 0.167.0.",
+      remediation: "Install codex-cli 0.167.0 and retry.",
     });
-    assert.equal(finding(result, "SCHEMA_COMPATIBILITY").severity, "blocker");
-    assert.equal(finding(result, "STRICT_CONFIG").severity, "blocker");
+    assert.deepEqual(
+      result.findings
+        .filter((entry) => entry.severity === "blocker")
+        .map((entry) => entry.code),
+      ["CODEX_VERSION"],
+    );
+    assert.deepEqual(finding(result, "SCHEMA_COMPATIBILITY"), {
+      severity: "warning",
+      code: "SCHEMA_COMPATIBILITY",
+      message: "Codex schema compatibility was not evaluated because the pinned Codex version was unavailable.",
+      remediation: "Install codex-cli 0.167.0 and retry.",
+    });
+    assert.deepEqual(finding(result, "STRICT_CONFIG"), {
+      severity: "warning",
+      code: "STRICT_CONFIG",
+      message: "Strict Codex configuration validation was not evaluated because the pinned Codex version was unavailable.",
+      remediation: "Install codex-cli 0.167.0 and retry.",
+    });
     assert.equal(strictSpawns, 0);
+    assert.equal(contractSpawns, 0);
+  });
+});
+
+test("derives schema compatibility from the generated contract", async (t) => {
+  await t.test("accepts a binary that regenerates the pinned contract", async () => {
+    await withFixture({}, async (fixture) => {
+      const result = await runUnchanged(fixture);
+      assert.deepEqual(finding(result, "SCHEMA_COMPATIBILITY"), {
+        severity: "ready",
+        code: "SCHEMA_COMPATIBILITY",
+        message: "The generated Codex app-server contract matches the pinned one.",
+      });
+    });
+  });
+
+  // The defect this finding exists for: a binary reporting the pinned version
+  // while emitting a contract the typed callers were not built against.
+  await t.test("blocks a pinned version whose contract drifted", async () => {
+    await withFixture({ codex: { contract: "drift" } }, async (fixture) => {
+      const result = await runUnchanged(fixture);
+      assert.equal(result.exitCode, 1);
+      assert.equal(finding(result, "CODEX_VERSION").severity, "ready");
+      assert.deepEqual(finding(result, "SCHEMA_COMPATIBILITY"), {
+        severity: "blocker",
+        code: "SCHEMA_COMPATIBILITY",
+        message: "The resolved Codex binary generates a different app-server contract than the pinned one.",
+        remediation: "Reinstall codex-cli 0.167.0 from a trusted source and retry.",
+      });
+    });
+  });
+
+  // A binary that failed the contract check must not be run again by the
+  // checks downstream of a compatible version.
+  await t.test("stops the strict-config probe after a contract mismatch", async () => {
+    await withFixture({ codex: { contract: "drift" } }, async (fixture) => {
+      let strictSpawns = 0;
+      const result = await runUnchanged(fixture, {}, {
+        beforeStrictSpawn() {
+          strictSpawns += 1;
+        },
+      });
+      assert.equal(strictSpawns, 0);
+      assert.deepEqual(finding(result, "STRICT_CONFIG"), {
+        severity: "warning",
+        code: "STRICT_CONFIG",
+        message: "Strict Codex configuration validation was not evaluated because the resolved Codex binary failed the contract check.",
+        remediation: "Reinstall codex-cli 0.167.0 from a trusted source and retry.",
+      });
+    });
+  });
+
+  await t.test("blocks when the contract cannot be generated", async () => {
+    await withFixture({ codex: { contract: "failure" } }, async (fixture) => {
+      const result = await runUnchanged(fixture);
+      assert.equal(result.exitCode, 1);
+      assert.equal(finding(result, "CODEX_VERSION").severity, "ready");
+      assert.deepEqual(finding(result, "SCHEMA_COMPATIBILITY"), {
+        severity: "blocker",
+        code: "SCHEMA_COMPATIBILITY",
+        message: "Codex schema compatibility cannot be established.",
+        remediation: "Reinstall codex-cli 0.167.0 from a trusted source and retry.",
+      });
+    });
+  });
+
+  // The scratch root is removed before the run returns, so the home has to be
+  // inspected while the hook holds it.
+  await t.test("generates into a fresh owner-only scratch home", async () => {
+    await withFixture({}, async (fixture) => {
+      let observations = 0;
+      await runUnchanged(fixture, {}, {
+        async beforeContractSpawn(codexHome) {
+          observations += 1;
+          assert.notEqual(codexHome, fixture.paths.codexHome);
+          const metadata = await lstat(codexHome);
+          assert.equal(metadata.isDirectory(), true);
+          assert.equal(metadata.mode & 0o777, 0o700);
+        },
+      });
+      assert.equal(observations, 1);
+    });
   });
 });
 
@@ -651,7 +835,7 @@ test("isolates and strictly validates the Codex version probe", async (t) => {
         versionBehavior: "late-descendant",
         markerPath,
       });
-      const result = await runUnchanged(fixture, { commandTimeoutMs: 40 });
+      const result = await runUnchanged(fixture, { commandTimeoutMs: 2000 });
       await assertRecordedProcessWasReaped(markerPath);
       assert.equal(finding(result, "CODEX_VERSION").severity, "blocker");
     });
@@ -866,7 +1050,69 @@ test("accepts only pinned owner-only file-backed authentication shapes", async (
   });
 });
 
+test("reports one safe strict-config duplicate-key location", async () => {
+  const stderrCanary = "strict-config-stderr-canary";
+  const stdoutCanary = "strict-config-stdout-canary";
+  await withFixture({}, async (fixture) => {
+    await writeCodexExecutable(fixture.paths.codexBin, {
+      strictBody: [
+        "printf '%s\\n' 'config.toml:63:11: duplicate key' >&2",
+        `printf '%s\\n' ${JSON.stringify(stderrCanary)} >&2`,
+        `printf '%s\\n' ${JSON.stringify(stdoutCanary)}`,
+        "exit 23",
+      ].join("\n"),
+    });
+    const result = await runUnchanged(fixture);
+    assert.deepEqual(finding(result, "STRICT_CONFIG"), {
+      severity: "blocker",
+      code: "STRICT_CONFIG",
+      message: "Strict Codex configuration validation failed at config.toml:63:11 (duplicate key).",
+      remediation: "Resolve the managed portable configuration before retrying.",
+    });
+    const serializedFindings = JSON.stringify(result.findings);
+    assert.equal(serializedFindings.includes(stderrCanary), false);
+    assert.equal(serializedFindings.includes(stdoutCanary), false);
+  });
+});
+
+test("keeps untrusted strict-config diagnostics generic", async (t) => {
+  const secret = "strict-config-untrusted-canary";
+  const genericFinding = {
+    severity: "blocker",
+    code: "STRICT_CONFIG",
+    message: "Strict Codex configuration validation failed.",
+    remediation: "Resolve the managed portable configuration before retrying.",
+  };
+  const failureBody = (...stderrLines) => [
+    ...stderrLines.map((line) => `printf '%s\\n' ${JSON.stringify(line)} >&2`),
+    "exit 23",
+  ].join("\n");
+  const cases = [
+    ["wrong basename", failureBody(`private.toml:63:11: duplicate key`, secret)],
+    ["zero line", failureBody(`config.toml:0:11: duplicate key`, secret)],
+    ["zero column", failureBody(`config.toml:63:0: duplicate key`, secret)],
+    ["negative line", failureBody(`config.toml:-63:11: duplicate key`, secret)],
+    ["overlong line", failureBody(`config.toml:1234567:11: duplicate key`, secret)],
+    ["unknown class", failureBody(`config.toml:63:11: parse error`, secret)],
+    ["stdout diagnostic", `printf '%s\\n' 'config.toml:63:11: duplicate key'\nprintf '%s\\n' 'strict-config-untrusted-canary' >&2\nexit 23`],
+    ["embedded source text", failureBody(`value = \"config.toml:63:11: duplicate key ${secret}\"`)],
+    ["multiple matches", failureBody(`config.toml:63:11: duplicate key`, `config.toml:64:12: duplicate key`, secret)],
+    ["control suffix", "printf 'config.toml:63:11: duplicate key\\033[2J\\n' >&2\nprintf '%s\\n' 'strict-config-untrusted-canary' >&2\nexit 23"],
+  ];
+  for (const [name, strictBody] of cases) {
+    await t.test(name, async () => {
+      await withFixture({}, async (fixture) => {
+        await writeCodexExecutable(fixture.paths.codexBin, { strictBody });
+        const result = await runUnchanged(fixture);
+        assert.deepEqual(finding(result, "STRICT_CONFIG"), genericFinding);
+        assert.equal(JSON.stringify(result.findings).includes(secret), false);
+      });
+    });
+  }
+});
+
 test("fails strict config on nonzero exit and timeout without leaking scratch", async (t) => {
+  const safeDiagnostic = "config.toml:63:11: duplicate key";
   await t.test("nonzero", async () => {
     await withFixture({ codex: { strict: "failure" } }, async (fixture) => {
       const result = await runUnchanged(fixture);
@@ -879,10 +1125,33 @@ test("fails strict config on nonzero exit and timeout without leaking scratch", 
     });
   });
   await t.test("timeout terminates and awaits the child", async () => {
-    await withFixture({ codex: { strict: "timeout" } }, async (fixture) => {
-      const result = await runUnchanged(fixture, { commandTimeoutMs: 40 });
-      assert.equal(finding(result, "STRICT_CONFIG").severity, "blocker");
+    await withFixture({ codex: { strict: "timeout", strictDiagnostic: safeDiagnostic } }, async (fixture) => {
+      const result = await runUnchanged(fixture);
+      assert.deepEqual(finding(result, "STRICT_CONFIG"), {
+        severity: "blocker",
+        code: "STRICT_CONFIG",
+        message: "Strict Codex configuration validation failed.",
+        remediation: "Resolve the managed portable configuration before retrying.",
+      });
       assert.equal(finding(result, "SCRATCH_CLEANUP").severity, "ready");
+    });
+  });
+  await t.test("overflow keeps a safe diagnostic generic", async () => {
+    await withFixture({}, async (fixture) => {
+      await writeCodexExecutable(fixture.paths.codexBin, {
+        strictBody: [
+          `printf '%s\\n' ${JSON.stringify(safeDiagnostic)} >&2`,
+          "/usr/bin/yes x | /usr/bin/head -c 70000 >&2",
+          "exit 23",
+        ].join("\n"),
+      });
+      const result = await runUnchanged(fixture);
+      assert.deepEqual(finding(result, "STRICT_CONFIG"), {
+        severity: "blocker",
+        code: "STRICT_CONFIG",
+        message: "Strict Codex configuration validation failed.",
+        remediation: "Resolve the managed portable configuration before retrying.",
+      });
     });
   });
   await t.test("kills an inherited-pipe descendant before cleanup", async () => {
@@ -891,8 +1160,9 @@ test("fails strict config on nonzero exit and timeout without leaking scratch", 
       await writeCodexExecutable(fixture.paths.codexBin, {
         strict: "late-descendant",
         markerPath,
+        strictDiagnostic: safeDiagnostic,
       });
-      const result = await runUnchanged(fixture, { commandTimeoutMs: 40 });
+      const result = await runUnchanged(fixture);
       await assertRecordedProcessWasReaped(markerPath);
       assert.equal(finding(result, "STRICT_CONFIG").severity, "blocker");
     });
@@ -903,6 +1173,7 @@ test("fails strict config on nonzero exit and timeout without leaking scratch", 
       await writeCodexExecutable(fixture.paths.codexBin, {
         strict: "redirected-descendant",
         markerPath,
+        strictDiagnostic: safeDiagnostic,
       });
       const result = await runUnchanged(fixture);
       await assertRecordedProcessWasReaped(markerPath);
@@ -1128,3 +1399,24 @@ test("turns injected cleanup failure into the stable scratch blocker", async () 
     });
   });
 });
+
+test("names the managed write boundary before a turn starts, without a personal path", async () => {
+  await withFixture({}, async (fixture) => {
+    const boundary = finding(await runUnchanged(fixture), "SANDBOX_BOUNDARY");
+
+    // A statement of the contract, not a health check: there is nothing here
+    // that can fail, and a run that reaches doctor already satisfies it.
+    assert.equal(boundary.severity, "ready");
+
+    // The three facts measured in docs/notes/2026-09-02-sandbox-boundary-measurement.md.
+    assert.match(boundary.message, /repository/);
+    assert.match(boundary.message, /\/tmp/);
+    assert.match(boundary.message, /TMPDIR/);
+
+    // Issue #23 step 5: the boundary is named by class, never by this
+    // machine's spelling of it.
+    assert.doesNotMatch(boundary.message, /\/Users\//);
+    assert.doesNotMatch(boundary.message, /\/Volumes\//);
+  });
+});
+

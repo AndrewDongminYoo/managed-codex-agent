@@ -472,6 +472,12 @@ function validPermissions(value: unknown): boolean {
 function validCommandParams(params: RecordValue): boolean {
   if (
     !hasOnlyKeys(params, [
+      // Added by codex 0.152.1, which declares it required: it separates a
+      // command from input written into an already-running terminal. Absent
+      // stays valid, because the field's own documentation says older servers
+      // default it to `command`, and this list is an allowlist rather than an
+      // exact set.
+      "kind",
       "threadId",
       "turnId",
       "itemId",
@@ -485,12 +491,28 @@ function validCommandParams(params: RecordValue): boolean {
       "commandActions",
       "proposedExecpolicyAmendment",
       "proposedNetworkPolicyAmendments",
+      // Sent by the pinned binary and absent from the generated params type,
+      // measured against codex 0.148.0 on 2026-08-26. It names a set of
+      // decisions, and that set does not bind the answer: the server accepted
+      // `decline` against a set of accept, acceptWithExecpolicyAmendment and
+      // cancel that omitted it, and the turn continued. So the key is allowed
+      // and nothing reads it.
+      "availableDecisions",
     ]) ||
     !requiredString(params, "threadId") ||
     !requiredString(params, "turnId") ||
     !requiredString(params, "itemId") ||
     !Number.isSafeInteger(params.startedAtMs) ||
     !nullableString(params.environmentId)
+  )
+    return false;
+  // An unrecognised kind is a shape this build does not understand, and the
+  // approval path answers those by refusing rather than by guessing which of
+  // the two it resembles.
+  if (
+    params.kind !== undefined &&
+    params.kind !== "command" &&
+    params.kind !== "writeStdin"
   )
     return false;
   if (
@@ -603,6 +625,11 @@ function validParams(method: KnownMethod, params: RecordValue): boolean {
     !validJson(params._meta)
   )
     return false;
+  // Only `form` and `url` are answered. codex 0.152.1 adds `openaiForm` to
+  // this union, alongside the `openai/form` 0.148.0 already carried, and
+  // neither is accepted. That is the posture rather than an oversight: a mode
+  // this build cannot render is answered by refusing, not by being treated as
+  // whichever of the two it most resembles.
   if (params.mode === "form")
     return (
       hasOnlyKeys(params, [
@@ -848,6 +875,10 @@ function choices(request: ValidRequest): readonly Choice[] {
       (request.params.proposedNetworkPolicyAmendments as unknown[]) ?? []
     ).slice(0, MAX_APPROVAL_LIST_ITEMS)) {
       const value = amendment as RecordValue;
+      // Selecting this changes policy for later requests, not only this one:
+      // the generated params type documents the field as amendments "for
+      // future requests". The label has no room to say so beside a host, so
+      // the context block states it next to each amendment (see `prompt`).
       values.push({
         id: String(values.length + 1),
         label: `Apply supplied network policy for ${boundedBytes(value.host as string, 64)}`,
@@ -860,6 +891,35 @@ function choices(request: ValidRequest): readonly Choice[] {
                 host: value.host,
                 action: value.action,
               },
+            },
+          },
+        },
+      });
+    }
+    // The server can also propose a narrower exec policy, and supplies the argv
+    // to grant. Offered whenever the field is present and non-empty;
+    // `availableDecisions` is deliberately not consulted, because it is
+    // undeclared by the schema this build is pinned to and was measured
+    // advisory rather than binding.
+    //
+    // The label names the scope because the scope is not this request: the
+    // generated params type documents the field as allowing similar commands
+    // WITHOUT prompting, so accepting it changes policy for later commands.
+    // `acceptedForSession` does not constrain that and cannot — nothing outside
+    // this file reads it, and the coordinator forwards `response` alone. The
+    // prompt is the only place the user learns what they are granting.
+    const execpolicyAmendment = request.params.proposedExecpolicyAmendment;
+    if (Array.isArray(execpolicyAmendment) && execpolicyAmendment.length > 0) {
+      values.push({
+        id: String(values.length + 1),
+        label:
+          "Apply supplied execpolicy amendment (allows similar commands without prompting)",
+        decision: "acceptWithExecpolicyAmendment",
+        acceptedForSession: false,
+        response: {
+          decision: {
+            acceptWithExecpolicyAmendment: {
+              execpolicy_amendment: execpolicyAmendment,
             },
           },
         },
@@ -953,6 +1013,7 @@ function hasCompletePromptContext(
     return false;
   const params = request.params;
   for (const key of [
+    "kind",
     "command",
     "cwd",
     "grantRoot",
@@ -987,6 +1048,21 @@ function hasCompletePromptContext(
         [amendment.host, amendment.action]
           .filter((value): value is string => typeof value === "string")
           .some((value) => !fitsDisplayed(value)),
+    )
+  )
+    return false;
+  // The amendment is granted in full while the prompt shows it bounded, so
+  // without this the user would authorize argv bytes the display had cut.
+  // Every other displayed field is gated here rather than trusted to
+  // `bounded()`, and refusing is what makes the truncation unreachable: a
+  // `command` too long to render already declines without prompting, and this
+  // makes the amendment behave the same way. It also bounds the array's size,
+  // which is otherwise unbounded, since an argv with too many tokens cannot
+  // fit the display budget either.
+  if (
+    Array.isArray(params.proposedExecpolicyAmendment) &&
+    !fitsDisplayed(
+      JSON.stringify(params.proposedExecpolicyAmendment.map(String)),
     )
   )
     return false;
@@ -1031,6 +1107,7 @@ function prompt(
   const context: string[] = [];
   const params = request.params;
   for (const key of [
+    "kind",
     "command",
     "cwd",
     "grantRoot",
@@ -1042,6 +1119,25 @@ function prompt(
   ] as const)
     if (typeof params[key] === "string")
       context.push(`${key}: ${bounded(params[key])}`);
+  // Without this the user would be offered the amendment choice above with
+  // no sight of the argv it grants. Two ways to display it wrongly, both of
+  // which authorize something other than what was shown, and both rejected:
+  // slicing the tokens drops the tail silently, and joining them on a space
+  // erases the argument boundaries, so ["bash", "-c", "echo safe"] renders
+  // identically to ["bash", "-c", "echo", "safe"] and an empty argument
+  // vanishes. JSON keeps every boundary, quotes whitespace, and shows an empty
+  // argument as "". An amendment too long to render is refused by
+  // `hasCompletePromptContext` before this runs, exactly as an over-long
+  // `command` is, so the bound here never silently cuts a granted argv.
+  if (
+    Array.isArray(params.proposedExecpolicyAmendment) &&
+    params.proposedExecpolicyAmendment.length > 0
+  )
+    context.push(
+      `execpolicy amendment: ${bounded(
+        JSON.stringify(params.proposedExecpolicyAmendment.map(String)),
+      )}`,
+    );
   if (isRecord(params.networkApprovalContext))
     context.push(
       `network: ${bounded(String(params.networkApprovalContext.protocol))}://${bounded(String(params.networkApprovalContext.host))}`,
@@ -1062,8 +1158,15 @@ function prompt(
       MAX_APPROVAL_LIST_ITEMS,
     )) {
       const value = amendment as RecordValue;
+      // The scope is disclosed here and not in the choice label. The label
+      // must keep the host, because the host is what tells two amendments
+      // apart, and `Apply supplied network policy for ` plus a host already
+      // meets MAX_CHOICE_LABEL_BYTES; a clause there would turn hosts that
+      // prompt today into declines. This line has the prompt budget instead,
+      // and a line that does not fit refuses the whole prompt below rather
+      // than dropping the clause, so the disclosure is never silently cut.
       context.push(
-        `network amendment: ${String(value.action)} ${String(value.host)}`,
+        `network amendment (applies to future requests): ${String(value.action)} ${String(value.host)}`,
       );
     }
   const requestedPermissions = isRecord(params.permissions)

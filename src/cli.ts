@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 /// <reference types="node" />
 
+import { realpathSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import { release, tmpdir } from "node:os";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 import {
@@ -11,8 +12,14 @@ import {
   SUPPORTED_CAPABILITIES,
   type RequestedCapability,
 } from "./constants.js";
+import { cleanGoneCommand } from "./commands/clean-gone.js";
+import { commitCommand, type CommitMessageFormat } from "./commands/commit.js";
 import { runDoctor } from "./commands/doctor.js";
+import { driftCommand } from "./commands/drift.js";
+import { prCommand } from "./commands/pr.js";
+import { reviewCommand } from "./commands/review.js";
 import { resumeCommand } from "./commands/resume.js";
+import { stagedReviewCommand } from "./commands/staged-review.js";
 import {
   runCommand,
   writeLine,
@@ -20,13 +27,26 @@ import {
   type CommandIO,
 } from "./commands/run.js";
 import { statusCommand } from "./commands/status.js";
+import { triageCommand } from "./commands/triage.js";
+import {
+  verifyFixCommand,
+  type VerifyFixOptions,
+} from "./commands/verify-fix.js";
 import { resolveRuntimePaths, type RuntimePaths } from "./runtime/paths.js";
 
 const usage = {
+  "clean-gone": "andrew-agent clean-gone",
+  commit: "andrew-agent commit [--long | --short]",
   doctor: "andrew-agent doctor",
+  drift: "andrew-agent drift",
+  pr: "andrew-agent pr [base]",
+  review: "andrew-agent review [--staged | base]",
   run: "andrew-agent run <repository> <prompt>",
   resume: "andrew-agent resume <thread-id> [prompt]",
   status: "andrew-agent status [thread-id]",
+  triage: "andrew-agent triage <pr>",
+  "verify-fix":
+    "andrew-agent verify-fix [base] [--with <path>]... [--test <path>]... -- <command> [args...]",
 } as const;
 
 type PublicCommand = keyof typeof usage;
@@ -46,7 +66,22 @@ const CAPABILITY_ASSIGNMENT = `${CAPABILITY_FLAG}=`;
 // The CLI never supplies one and passes `undefined` so the callee's default
 // applies, but the type says what the functions actually accept.
 interface CommandHandlers {
+  readonly "clean-gone": (io: CommandIO) => Promise<ExitCode>;
+  readonly commit: (
+    io: CommandIO,
+    messageFormat: CommitMessageFormat,
+  ) => Promise<ExitCode>;
   readonly doctor: (io: CommandIO, env: NodeJS.ProcessEnv) => Promise<ExitCode>;
+  readonly drift: (io: CommandIO) => Promise<ExitCode>;
+  readonly pr: (
+    baseRef: string | undefined,
+    io: CommandIO,
+  ) => Promise<ExitCode>;
+  readonly review: (
+    baseRef: string | undefined,
+    io: CommandIO,
+    staged: boolean,
+  ) => Promise<ExitCode>;
   readonly run: (
     repository: string,
     prompt: string,
@@ -65,6 +100,11 @@ interface CommandHandlers {
     threadId: string | undefined,
     io: CommandIO,
   ) => Promise<ExitCode>;
+  readonly triage: (pullRequest: number, io: CommandIO) => Promise<ExitCode>;
+  readonly "verify-fix": (
+    options: VerifyFixOptions,
+    io: CommandIO,
+  ) => Promise<ExitCode>;
 }
 
 interface MainOptions extends CommandIO {
@@ -73,10 +113,21 @@ interface MainOptions extends CommandIO {
 }
 
 const defaultHandlers: CommandHandlers = {
+  "clean-gone": (io) => cleanGoneCommand(process.cwd(), io),
+  commit: (io, messageFormat) =>
+    commitCommand(process.cwd(), io, undefined, messageFormat),
   doctor: doctorCommand,
+  drift: (io) => driftCommand(process.cwd(), io),
+  pr: (baseRef, io) => prCommand(process.cwd(), baseRef, io),
+  review: (baseRef, io, staged) =>
+    staged
+      ? stagedReviewCommand(process.cwd(), io)
+      : reviewCommand(process.cwd(), baseRef, io),
   run: runCommand,
   resume: resumeCommand,
   status: statusCommand,
+  triage: (pullRequest, io) => triageCommand(process.cwd(), pullRequest, io),
+  "verify-fix": (options, io) => verifyFixCommand(process.cwd(), options, io),
 };
 
 export async function main(
@@ -102,13 +153,15 @@ export async function main(
     const command = argv[0];
     if (!isPublicCommand(command)) return await usageFailure(io);
     const commandArguments = argv.slice(1);
+    if (command === "verify-fix")
+      return await verifyFix(commandArguments, io, handlers);
     const separatorIndex = commandArguments.indexOf("--");
     const optionRegion =
       separatorIndex < 0
         ? commandArguments
         : commandArguments.slice(0, separatorIndex);
     if (optionRegion.some((argument) => !isAllowedOption(argument)))
-      return await usageFailure(io);
+      return await usageFailure(io, command);
     let parsed;
     try {
       parsed = parseArgs({
@@ -118,20 +171,38 @@ export async function main(
         options: {
           help: { type: "boolean", short: "h" },
           capability: { type: "string", multiple: true },
+          long: { type: "boolean" },
+          short: { type: "boolean" },
+          staged: { type: "boolean" },
         },
       });
     } catch {
-      return await usageFailure(io);
+      return await usageFailure(io, command);
     }
     if (parsed.values.help === true) {
-      if (parsed.positionals.length !== 0) return await usageFailure(io);
+      if (parsed.positionals.length !== 0)
+        return await usageFailure(io, command);
       await writeLine(io.stdout, `Usage: ${usage[command]}`);
       return 0;
     }
     const positionals = parsed.positionals;
-    if (!validPositionals(command, positionals)) return await usageFailure(io);
+    if (!validPositionals(command, positionals))
+      return await usageFailure(io, command);
+    // `--staged` replaces the base ref, so the two never combine.
+    if (
+      parsed.values.staged !== undefined &&
+      (command !== "review" || positionals.length !== 0)
+    )
+      return await usageFailure(io, command);
     const capabilities = readCapabilities(command, parsed.values.capability);
-    if (capabilities === undefined) return await usageFailure(io);
+    if (capabilities === undefined) return await usageFailure(io, command);
+    const commitMessageFormat = readCommitMessageFormat(
+      command,
+      parsed.values.long,
+      parsed.values.short,
+    );
+    if (commitMessageFormat === undefined)
+      return await usageFailure(io, command);
     const missingInput = missingCapabilityInput(capabilities, env);
     if (missingInput !== undefined) {
       await writeLine(
@@ -140,10 +211,18 @@ export async function main(
       );
       return 3;
     }
+    if (command === "clean-gone") return await handlers["clean-gone"](io);
+    if (command === "commit")
+      return await handlers.commit(io, commitMessageFormat);
     if (command === "doctor") return await handlers.doctor(io, env);
-    // ponytail: the requested set reaches the handler and is ignored there
-    // until step 2 of docs/plans/2026-08-25-v0.2-oracle-capability.md threads
-    // it into prepareCandidate. Parsing it is not yet enabling it.
+    if (command === "drift") return await handlers.drift(io);
+    if (command === "pr") return await handlers.pr(positionals[0], io);
+    if (command === "review")
+      return await handlers.review(
+        positionals[0],
+        io,
+        parsed.values.staged === true,
+      );
     if (command === "run")
       return await handlers.run(
         positionals[0]!,
@@ -160,6 +239,8 @@ export async function main(
         undefined,
         capabilities,
       );
+    if (command === "triage")
+      return await handlers.triage(Number(positionals[0]), io);
     return await handlers.status(positionals[0], io);
   } catch {
     try {
@@ -254,9 +335,23 @@ function isAllowedOption(argument: string): boolean {
   return (
     argument === "-h" ||
     argument === "--help" ||
+    argument === "--long" ||
+    argument === "--short" ||
+    argument === "--staged" ||
     argument === CAPABILITY_FLAG ||
     argument.startsWith(CAPABILITY_ASSIGNMENT)
   );
+}
+
+function readCommitMessageFormat(
+  command: PublicCommand,
+  long: boolean | undefined,
+  short: boolean | undefined,
+): CommitMessageFormat | undefined {
+  if (command !== "commit")
+    return long === undefined && short === undefined ? "long" : undefined;
+  if (long === true && short === true) return undefined;
+  return short === true ? "short" : "long";
 }
 
 // Returns the sorted unique requested set, or undefined when the request is
@@ -302,10 +397,22 @@ function validPositionals(
   positionals: readonly string[],
 ): boolean {
   if (positionals.some((value) => value.length === 0)) return false;
+  if (command === "clean-gone") return positionals.length === 0;
+  if (command === "commit") return positionals.length === 0;
   if (command === "doctor") return positionals.length === 0;
+  if (command === "drift") return positionals.length === 0;
+  if (command === "pr") return positionals.length <= 1;
+  if (command === "review") return positionals.length <= 1;
   if (command === "run") return positionals.length === 2;
   if (command === "resume")
     return positionals.length === 1 || positionals.length === 2;
+  if (command === "triage")
+    // GitHub's GraphQL `Int` is 32-bit signed.
+    return (
+      positionals.length === 1 &&
+      /^[1-9]\d{0,9}$/.test(positionals[0]!) &&
+      Number(positionals[0]) <= 2_147_483_647
+    );
   return positionals.length <= 1;
 }
 
@@ -314,22 +421,107 @@ function isPublicCommand(value: string | undefined): value is PublicCommand {
 }
 
 async function topLevelHelp(io: CommandIO): Promise<void> {
-  await writeLine(io.stdout, "Usage:");
-  await writeLine(io.stdout, usage.doctor);
-  await writeLine(io.stdout, usage.run);
-  await writeLine(io.stdout, usage.resume);
-  await writeLine(io.stdout, usage.status);
+  await writeUsage(io.stdout);
 }
 
-async function usageFailure(io: CommandIO): Promise<2> {
+async function usageFailure(
+  io: CommandIO,
+  command?: PublicCommand,
+): Promise<2> {
   await writeLine(io.stderr, "Invalid command usage.");
+  await writeUsage(io.stderr, command);
   return 2;
 }
 
+async function writeUsage(
+  output: CommandIO["stdout"],
+  command?: PublicCommand,
+): Promise<void> {
+  if (command !== undefined) {
+    await writeLine(output, `Usage: ${usage[command]}`);
+    return;
+  }
+  await writeLine(output, "Usage:");
+  await writeLine(output, usage["clean-gone"]);
+  await writeLine(output, usage.commit);
+  await writeLine(output, usage.doctor);
+  await writeLine(output, usage.drift);
+  await writeLine(output, usage.pr);
+  await writeLine(output, usage.review);
+  await writeLine(output, usage.run);
+  await writeLine(output, usage.resume);
+  await writeLine(output, usage.status);
+  await writeLine(output, usage.triage);
+  await writeLine(output, usage["verify-fix"]);
+}
+
+// The test command after `--` belongs to the user and is passed through
+// unparsed, so only the region before the first `--` is read as options.
+async function verifyFix(
+  commandArguments: readonly string[],
+  io: CommandIO,
+  handlers: CommandHandlers,
+): Promise<ExitCode> {
+  const separatorIndex = commandArguments.indexOf("--");
+  const optionRegion =
+    separatorIndex < 0
+      ? commandArguments
+      : commandArguments.slice(0, separatorIndex);
+  const withPaths: string[] = [];
+  const testPaths: string[] = [];
+  const positionals: string[] = [];
+  let help = false;
+  for (let index = 0; index < optionRegion.length; index += 1) {
+    const argument = optionRegion[index]!;
+    if (argument === "-h" || argument === "--help") {
+      help = true;
+    } else if (argument === "--with" || argument === "--test") {
+      const value = optionRegion[index + 1];
+      if (value === undefined || value === "" || value.startsWith("-"))
+        return await usageFailure(io, "verify-fix");
+      (argument === "--with" ? withPaths : testPaths).push(value);
+      index += 1;
+    } else if (argument.startsWith("-") || argument === "") {
+      return await usageFailure(io, "verify-fix");
+    } else {
+      positionals.push(argument);
+    }
+  }
+  if (help) {
+    if (
+      separatorIndex >= 0 ||
+      positionals.length !== 0 ||
+      optionRegion.length !== 1
+    )
+      return await usageFailure(io, "verify-fix");
+    await writeLine(io.stdout, `Usage: ${usage["verify-fix"]}`);
+    return 0;
+  }
+  const command = commandArguments.slice(separatorIndex + 1);
+  if (
+    separatorIndex < 0 ||
+    command.length === 0 ||
+    command[0] === "" ||
+    positionals.length > 1
+  )
+    return await usageFailure(io, "verify-fix");
+  return await handlers["verify-fix"](
+    {
+      ...(positionals[0] === undefined ? {} : { baseInput: positionals[0] }),
+      withPaths,
+      testPaths,
+      command,
+    },
+    io,
+  );
+}
+
+// A global install reaches this file through a symbolic link, so argv[1] is the
+// link while import.meta.url is the resolved module; compare real paths.
 const invokedPath = process.argv[1];
 if (
   invokedPath !== undefined &&
-  import.meta.url === pathToFileURL(invokedPath).href
+  realpathSync(fileURLToPath(import.meta.url)) === realpathSync(invokedPath)
 ) {
   process.exitCode = await main();
 }

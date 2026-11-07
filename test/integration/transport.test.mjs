@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
+import { promisify } from "node:util";
 
 const transportModule = await import(
   "../../dist/app-server/transport.js"
@@ -82,6 +83,49 @@ async function waitForChildExit(child, timeoutMs = 1000) {
     }, timeoutMs);
     child.once("exit", onExit);
   });
+}
+
+// Returns undefined when no positive pid appears before the deadline or once `stop()` holds; an empty file is not a pid, because Number("") is 0.
+async function readPositivePid(path, { timeoutMs = 30_000, stop = () => false } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const pid = Number(await readFile(path, "utf8"));
+      if (Number.isSafeInteger(pid) && pid > 0) return pid;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    if (stop() || Date.now() >= deadline) return undefined;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+const execFileAsync = promisify(execFile);
+
+// SIGKILLs every live process whose command line carries the marker, and repeats until one snapshot shows none, so a process spawned between a snapshot and its kill is caught by the next snapshot.
+// The marker must be unique to one test run, such as its mkdtemp root.
+async function reapProcessesCarrying(marker, { timeoutMs = 2_000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    // Full command lines on a busy machine already reach a quarter of execFile's default 1 MiB buffer.
+    const { stdout } = await execFileAsync("ps", ["-A", "-ww", "-o", "pid=,stat=,command="], { maxBuffer: 64 * 1024 * 1024 });
+    const pids = stdout
+      .split("\n")
+      .map((line) => /^\s*(\d+)\s+(\S+)\s+(.*)$/.exec(line))
+      .filter((match) => match !== null && !match[2].startsWith("Z") && match[3].includes(marker))
+      .map((match) => Number(match[1]))
+      .filter((pid) => pid !== process.pid);
+    if (pids.length === 0) return;
+    if (Date.now() >= deadline) throw new Error(`processes carrying ${marker} survived reaping: ${pids.join(", ")}`);
+    for (const pid of pids) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
 }
 
 function errorCode(code) {
@@ -228,9 +272,10 @@ test("rejects a newline-free protocol line over 16 MiB without disclosing it and
   await withProtocolChild(
     `process.stdout.write("private-payload:" + "x".repeat(16 * 1024 * 1024)); setInterval(() => {}, 1000);`,
     async (child) => {
+      // This test exercises the line limit, not the request timeout, so the timeout must outlast a slow child start-up and write.
       const transport = new (requireTransport().StdioJsonRpcTransport)(
         child,
-        300,
+        30_000,
       );
       let failure;
       await transport.request("initialize", {}).catch((error) => {
@@ -249,9 +294,10 @@ test("measures the 16 MiB protocol line limit in UTF-8 wire bytes", async () => 
   await withProtocolChild(
     `process.stdout.write("é".repeat(8 * 1024 * 1024 + 1)); setInterval(() => {}, 1000);`,
     async (child) => {
+      // This test exercises the line limit, not the request timeout, so the timeout must outlast a slow child start-up and write.
       const transport = new (requireTransport().StdioJsonRpcTransport)(
         child,
-        300,
+        30_000,
       );
       await assert.rejects(
         transport.request("initialize", {}),
@@ -453,12 +499,18 @@ test("fails closed when reentrant stdout exceeds the bounded pending-input count
   );
   await response;
 
-  const outcome = await Promise.race([
-    failure,
-    new Promise((resolve) =>
-      setTimeout(() => resolve({ code: "TEST_TIMEOUT" }), 50),
-    ),
-  ]);
+  let hungTimer;
+  let outcome;
+  try {
+    outcome = await Promise.race([
+      failure,
+      new Promise((resolve) => {
+        hungTimer = setTimeout(() => resolve({ code: "TEST_TIMEOUT" }), 30_000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(hungTimer);
+  }
   assert.equal(outcome.code, "APP_SERVER_PROTOCOL_LIMIT");
   await transport.close();
 });
@@ -579,7 +631,7 @@ test("makes handshake timeout terminal", async () => {
   const binary = join(root, "codex");
   await writeFile(
     binary,
-    `#!/bin/sh\nif [ "$1" = "--version" ]; then echo 'codex-cli 0.148.0'; else exec ${JSON.stringify(process.execPath)} -e 'setInterval(() => {}, 1000)'; fi\n`,
+    `#!/bin/sh\nif [ "$1" = "--version" ]; then echo 'codex-cli 0.167.0'; else exec ${JSON.stringify(process.execPath)} -e 'setInterval(() => {}, 1000)'; fi\n`,
     { mode: 0o700 },
   );
   try {
@@ -828,55 +880,92 @@ test("rejects handshake timeout before descendant-held stdio closes", async () =
   const binary = join(root, "codex");
   const server = join(root, "server.mjs");
   const descendantPid = join(root, "descendant.pid");
+  await writeFile(descendantPid, "");
   await writeFile(
     binary,
-    `#!/bin/sh\nif [ "$1" = "--version" ]; then echo 'codex-cli 0.148.0'; else exec ${JSON.stringify(process.execPath)} ${JSON.stringify(server)}; fi\n`,
+    `#!/bin/sh\nif [ "$1" = "--version" ]; then echo 'codex-cli 0.167.0'; else exec ${JSON.stringify(process.execPath)} ${JSON.stringify(server)}; fi\n`,
     { mode: 0o700 },
   );
   await writeFile(
     server,
-    `import { spawn } from "node:child_process"; import { writeFile } from "node:fs/promises"; const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "inherit" }); await writeFile(${JSON.stringify(descendantPid)}, String(descendant.pid)); setInterval(() => {}, 1000);`,
+    `import { spawn } from "node:child_process"; import { writeFile } from "node:fs/promises"; const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", ${JSON.stringify(root)}], { stdio: "inherit" }); await new Promise((resolve) => setTimeout(resolve, 100)); await writeFile(${JSON.stringify(descendantPid)}, String(descendant.pid)); setInterval(() => {}, 1000);`,
   );
   const startup = requireClient().startAppServer({
     codexBinary: binary,
     codexHome: join(root, "home"),
     productVersion: "0.1.0",
-    handshakeTimeoutMs: 500,
+    // The handshake timer starts at spawn, so this value sits far above the fake's start-up (Node started in at most 0.07 s at load 77) that load cannot reach; the property checked here does not depend on it.
+    handshakeTimeoutMs: 5_000,
     requestTimeoutMs: 300,
   });
   const observed = startup.then(
     () => ({ value: "resolved" }),
     (error) => ({ error }),
   );
+  let startupSettled = false;
+  void observed.then(() => {
+    startupSettled = true;
+  });
   let pid;
+  let completed = false;
   try {
-    for (let attempt = 0; attempt < 50; attempt++) {
-      try {
-        pid = Number(await readFile(descendantPid, "utf8"));
-        break;
-      } catch (error) {
-        if (error.code !== "ENOENT") throw error;
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
+    pid = await readPositivePid(descendantPid, { stop: () => startupSettled });
+    assert.equal(
+      startupSettled,
+      false,
+      "the descendant did not start before the handshake timeout settled startup",
+    );
+    assert.equal(Number.isSafeInteger(pid) && pid > 0, true);
+    let hungTimer;
+    let outcome;
+    try {
+      outcome = await Promise.race([
+        observed,
+        new Promise((resolve) => {
+          hungTimer = setTimeout(
+            () => resolve({ value: "bounded-timeout" }),
+            30_000,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(hungTimer);
     }
-    assert.equal(Number.isSafeInteger(pid), true);
-    const outcome = await Promise.race([
-      observed,
-      new Promise((resolve) =>
-        setTimeout(() => resolve({ value: "bounded-timeout" }), 1200),
-      ),
-    ]);
     assert.equal(outcome.error?.code, "APP_SERVER_HANDSHAKE_TIMEOUT");
+    completed = true;
   } finally {
-    if (Number.isSafeInteger(pid)) {
+    // The descendant's command line and the fake server's script path both carry root, so this reaps them even when the pid file was never written, before any wait that descendant-held stdio could block.
+    const reapError = await reapProcessesCarrying(root).then(
+      () => undefined,
+      (error) => error,
+    );
+    const cleanupPid =
+      Number.isSafeInteger(pid) && pid > 0
+        ? pid
+        : await readPositivePid(descendantPid, { timeoutMs: 500 });
+    if (cleanupPid !== undefined) {
       try {
-        process.kill(pid, "SIGKILL");
+        process.kill(cleanupPid, "SIGKILL");
       } catch (error) {
         if (error.code !== "ESRCH") throw error;
       }
     }
-    await observed;
+    // Bounded above the 5 s handshake timeout plus the transport's 250 ms SIGTERM-to-SIGKILL grace.
+    // Startup is only unsettled here when the body already failed, so the body's own assertion is the reported failure and this wait only keeps cleanup from hanging.
+    let settleTimer;
+    await Promise.race([
+      observed,
+      new Promise((resolve) => {
+        settleTimer = setTimeout(resolve, 15_000);
+      }),
+    ]);
+    clearTimeout(settleTimer);
     await rm(root, { recursive: true, force: true });
+    if (reapError !== undefined) {
+      // Throwing here would replace a failure the body already raised, which carries the test's message.
+      if (completed) throw reapError;
+      console.error(reapError);
+    }
   }
 });
 
@@ -885,9 +974,10 @@ test("handles an app-server spawn error without hanging", async () => {
   const binary = join(root, "codex");
   await writeFile(
     binary,
-    `#!/bin/sh\nif [ "$1" = "--version" ]; then rm "$0"; echo 'codex-cli 0.148.0'; fi\n`,
+    `#!/bin/sh\nif [ "$1" = "--version" ]; then rm "$0"; echo 'codex-cli 0.167.0'; fi\n`,
     { mode: 0o700 },
   );
+  let hungTimer;
   try {
     const startup = requireClient().startAppServer({
       codexBinary: binary,
@@ -899,16 +989,17 @@ test("handles an app-server spawn error without hanging", async () => {
     await assert.rejects(
       Promise.race([
         startup,
-        new Promise((_, reject) =>
-          setTimeout(
+        new Promise((_, reject) => {
+          hungTimer = setTimeout(
             () => reject(new Error("spawn error did not settle")),
-            500,
-          ),
-        ),
+            30_000,
+          );
+        }),
       ]),
       errorCode("APP_SERVER_START_FAILED"),
     );
   } finally {
+    clearTimeout(hungTimer);
     await rm(root, { recursive: true, force: true });
   }
 });
