@@ -1,5 +1,11 @@
 # managed-codex-agent
 
+> [!IMPORTANT]
+> This snapshot is archived and no longer updated.
+> Development continues in
+> [AndrewDongminYoo/andrew-code-agent](https://github.com/AndrewDongminYoo/andrew-code-agent),
+> which now carries the same license, security policy and design documents.
+
 A harness that turns a Codex CLI profile into a content-addressed bundle,
 installs it into an isolated managed home, verifies the result before spending a
 turn, and then drives `codex app-server` over JSON-RPC with every byte it prints
